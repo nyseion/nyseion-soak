@@ -543,8 +543,10 @@ async fn qpack_flood(p: &H3Policy, target: SocketAddr) -> ScenarioResult {
 /// Table Capacity 0 (byte 0x20) — which the decoder consumes as valid no-ops — followed by one
 /// unterminated Set Dynamic Table Capacity instruction (0x3f and a long run of 0x80 continuation
 /// bytes) that cannot be consumed and so accumulates past the server's backlog cap
-/// (`qpack_max_table_capacity * 4 + RETAIN_MAX`, here RETAIN_MAX). The server closes with
-/// H3_EXCESSIVE_LOAD (App 0x0107, `H3Policy::excessive_load`). The plain 0x20
+/// (`qpack_max_table_capacity * 4 + RETAIN_MAX`, here RETAIN_MAX), or that the server refuses as
+/// malformed once its integer cannot fit 62 bits. The server closes with one of
+/// `H3Policy::qpack_backlog_codes`: H3_EXCESSIVE_LOAD (0x0107) for a backlog cap, or
+/// QPACK_ENCODER_STREAM_ERROR (0x0201) for the malformed integer. The plain 0x20
 /// run alone is consumed and draws no close; this scenario confirms the backlog cap it is meant to
 /// probe.
 async fn qpack_backlog(p: &H3Policy, target: SocketAddr) -> ScenarioResult {
@@ -579,15 +581,19 @@ async fn qpack_backlog(p: &H3Policy, target: SocketAddr) -> ScenarioResult {
   drop(held);
   ep.close(client::H3_NO_ERROR, b"");
   match closed {
-    Closed::App(code) if code == p.excessive_load => pass(
+    Closed::App(code) if p.accepts_qpack_backlog_close(code) => pass(
       name,
-      format!("excessive load (0x{code:04x}) for an encoder-stream backlog past the cap"),
+      format!("closed with 0x{code:04x} for an encoder-stream instruction that never completes"),
     ),
     other => {
-      let want = p.excessive_load;
+      let want: Vec<String> =
+        p.qpack_backlog_codes.iter().map(|el| format!("0x{el:04x}")).collect();
       fail(
         name,
-        format!("expected App(0x{want:04x}) for the encoder-stream backlog, got {other:?}"),
+        format!(
+          "expected App({}) for the encoder-stream backlog, got {other:?}",
+          want.join(" or ")
+        ),
       )
     }
   }

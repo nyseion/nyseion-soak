@@ -74,7 +74,8 @@ The HTTP/3 limits are `h3` flags, with rimu-ws's values as defaults:
 
 | Flag | Default | Used by |
 |---|---|---|
-| `--excessive-load-code` | `0x0107` (H3_EXCESSIVE_LOAD) | every rate-budget scenario |
+| `--excessive-load-code` | `0x0107` (H3_EXCESSIVE_LOAD) | every rate-budget scenario but `qpack_backlog` |
+| `--qpack-backlog-codes` | `0x0107,0x0201` | `qpack_backlog` |
 | `--max-bidi-streams` | 256 | `credit_starved` |
 | `--stateless-reset-rate` | 100/s | `forged_short_header` |
 | `--server-idle-timeout` | 30 s | `window_starved`, `never_read` |
@@ -224,7 +225,7 @@ a server without that limit, or set the flag that names its value.
 | `credit_starved` | `--max-bidi-streams` open streams held, then one more | the extra stream gets no credit, and the connection stays up (RFC 9000 4.6) |
 | `window_starved` | a request for the large file with every stream window 0 | no body arrives, the server's traffic goes quiet, and it closes between 2/3 and 2 × `--server-idle-timeout` |
 | `qpack_flood` | Set Dynamic Table Capacity 4,096 on the encoder stream when the server allowed 0 | closed with QPACK_ENCODER_STREAM_ERROR 0x0201 (RFC 9204 4.3.1) |
-| `qpack_backlog` | 4,096 valid no-op capacity instructions, then one that never ends | closed with `--excessive-load-code` (*policy*: a cap on the encoder stream backlog) |
+| `qpack_backlog` | 4,096 valid no-op capacity instructions, then one that never ends | closed with one of `--qpack-backlog-codes` (default 0x0107 H3_EXCESSIVE_LOAD for a backlog cap, or 0x0201 QPACK_ENCODER_STREAM_ERROR for the integer refused as malformed, RFC 9204 §4.1.1) |
 | `oversized_heads` | a request with a 20 KiB field section | a 431 response on the stream (raw or Huffman-coded `:status`), the connection still up (RFC 9114 4.2.2) |
 | `slow_reader` | `GET` the large file, read slowly for ~20 reads | bytes right (with `--big-pattern`), some read, the connection still up |
 | `never_read` | 20 `GET`s of the large file, never read, held for min(6 s, idle / 2) | the connection still up (the RSS gate bounds the server) |

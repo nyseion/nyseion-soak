@@ -33,6 +33,11 @@ pub struct H3Policy {
   /// PATH_CHALLENGEs, NEW_CONNECTION_IDs, QPACK encoder backlog): RFC 9114's H3_EXCESSIVE_LOAD,
   /// 0x0107, by default.
   pub excessive_load: u64,
+  /// The application close codes `qpack_backlog` accepts for an encoder stream that never
+  /// completes an instruction. Two answers bound the backlog: a cap on what is buffered
+  /// (H3_EXCESSIVE_LOAD, 0x0107) and refusing the instruction as malformed once its integer
+  /// cannot fit 62 bits (QPACK_ENCODER_STREAM_ERROR, 0x0201, RFC 9204 §4.1.1). Both by default.
+  pub qpack_backlog_codes: Vec<u64>,
   /// The bidirectional streams the server allows a client at once (`initial_max_streams_bidi`).
   pub max_bidi_streams: u32,
   /// Stateless resets (or any replies) the server may send per second to unknown connection IDs.
@@ -56,12 +61,20 @@ pub struct H3Policy {
   pub scenarios: Option<Vec<String>>,
 }
 
+impl H3Policy {
+  /// Whether `qpack_backlog` passes with the application close `code`.
+  pub fn accepts_qpack_backlog_close(&self, code: u64) -> bool {
+    self.qpack_backlog_codes.contains(&code)
+  }
+}
+
 impl Default for H3Policy {
   fn default() -> Self {
     Self {
       server_name: "localhost".into(),
       routes: Routes::default(),
       excessive_load: 0x0107,
+      qpack_backlog_codes: vec![0x0107, 0x0201],
       max_bidi_streams: 256,
       stateless_reset_per_sec: 100,
       idle_timeout: Duration::from_secs(30),
@@ -515,4 +528,26 @@ pub struct H3Report {
   pub wall_s: f64,
   /// The RSS checks, the steady clients, then every scenario, in that order.
   pub results: Vec<Line>,
+}
+
+#[cfg(test)]
+mod qpack_backlog_policy_tests {
+  use super::H3Policy;
+
+  #[test]
+  fn default_accepts_the_backlog_cap_and_the_encoder_stream_error() {
+    let p = H3Policy::default();
+    // H3_EXCESSIVE_LOAD: a cap on the buffered backlog (rimu-ws).
+    assert!(p.accepts_qpack_backlog_close(0x0107));
+    // QPACK_ENCODER_STREAM_ERROR: the integer is rejected as malformed (rimu-qpack, RFC 9204).
+    assert!(p.accepts_qpack_backlog_close(0x0201));
+    assert!(!p.accepts_qpack_backlog_close(0x0100));
+  }
+
+  #[test]
+  fn a_custom_list_accepts_only_its_codes() {
+    let p = H3Policy { qpack_backlog_codes: vec![0x0201], ..H3Policy::default() };
+    assert!(p.accepts_qpack_backlog_close(0x0201));
+    assert!(!p.accepts_qpack_backlog_close(0x0107));
+  }
 }

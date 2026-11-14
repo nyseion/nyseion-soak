@@ -307,6 +307,11 @@ struct H3Args {
   /// The application close code for a client over a rate budget (H3_EXCESSIVE_LOAD is 0x0107).
   #[arg(long, default_value = "0x0107", value_parser = parse_u64)]
   excessive_load_code: u64,
+  /// The application close codes `qpack_backlog` accepts: a backlog cap (0x0107,
+  /// H3_EXCESSIVE_LOAD) or the encoder-stream integer refused as malformed (0x0201,
+  /// QPACK_ENCODER_STREAM_ERROR).
+  #[arg(long, value_delimiter = ',', default_value = "0x0107,0x0201", value_parser = parse_u64)]
+  qpack_backlog_codes: Vec<u64>,
   /// The bidirectional streams the server allows a client at once.
   #[arg(long, default_value_t = 256)]
   max_bidi_streams: u32,
@@ -648,6 +653,7 @@ async fn run_h3(args: H3Args) -> Result<ExitCode, String> {
     server_name: args.server_name.clone(),
     routes: args.routes.routes(),
     excessive_load: args.excessive_load_code,
+    qpack_backlog_codes: args.qpack_backlog_codes.clone(),
     max_bidi_streams: args.max_bidi_streams,
     stateless_reset_per_sec: args.stateless_reset_rate,
     idle_timeout: args.server_idle_timeout,
