@@ -26,7 +26,7 @@ const SLOW: Duration = Duration::from_secs(20);
 
 /// A message of 3/4 to all of the size limit, or one byte over it (a quarter of the time), in
 /// 16 KiB fragments over about 3 s. Under the limit it is echoed whole; over it, the server refuses
-/// with 1009 once the fragments pass the limit. Many at once show what the server holds per
+/// with 1009 (`Expect::too_big`) once the fragments pass the limit. Many at once show what the server holds per
 /// connection: up to the limit, which the monitor's budget allows for.
 pub(super) async fn frag_drip(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   let max = usize::try_from(ctx.limits.max_payload).unwrap_or(usize::MAX);
@@ -53,7 +53,7 @@ pub(super) async fn frag_drip(ctx: &Ctx, rng: &mut Rng) -> Outcome {
     sleep(pause).await;
   }
   if over {
-    if let Err(err) = conn.expect_close(&[1009], Instant::now() + CLOSE).await {
+    if let Err(err) = conn.expect_close(&ctx.expect.too_big, Instant::now() + CLOSE).await {
       return from_err(err, Some(&conn));
     }
   } else {

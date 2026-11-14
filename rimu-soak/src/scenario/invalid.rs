@@ -53,12 +53,13 @@ impl InvalidCase {
   ];
 }
 
-/// The close codes RFC 6455 has the server answer `case` with.
-pub fn expected_codes(case: InvalidCase) -> &'static [u16] {
+/// The close codes RFC 6455 has the server answer `case` with: 1007 for bad UTF-8 (section 8.1),
+/// `too_big` (1009 by default, section 7.4.1) for a message over the limit, 1002 for the rest.
+pub fn expected_codes(case: InvalidCase, too_big: &[u16]) -> Vec<u16> {
   match case {
-    InvalidCase::BadUtf8 => &[1007],
-    InvalidCase::Oversized => &[1009],
-    _ => &[1002],
+    InvalidCase::BadUtf8 => vec![1007],
+    InvalidCase::Oversized => too_big.to_vec(),
+    _ => vec![1002],
   }
 }
 
@@ -138,8 +139,8 @@ pub async fn run_case(case: InvalidCase, ctx: &Ctx, rng: &mut Rng) -> Outcome {
   if let Err(err) = conn.send(&case_bytes(case, ctx.limits.max_payload, rng)).await {
     return from_err(err, Some(&conn));
   }
-  let codes = expected_codes(case);
-  if let Err(err) = conn.expect_close(codes, Instant::now() + CLOSE).await {
+  let codes = expected_codes(case, &ctx.expect.too_big);
+  if let Err(err) = conn.expect_close(&codes, Instant::now() + CLOSE).await {
     return from_err(err, Some(&conn));
   }
   match conn.expect_eof(Instant::now() + CLOSE).await {
@@ -149,7 +150,8 @@ pub async fn run_case(case: InvalidCase, ctx: &Ctx, rng: &mut Rng) -> Outcome {
 }
 
 /// Declares a length the server can't accept, then trickles payload: the server must close with
-/// 1009 (or 1002) at once, without waiting for, or allocating, the payload.
+/// 1009 (or 1002, or another of `Expect::too_big`) at once, without waiting for, or allocating, the
+/// payload.
 pub(super) async fn huge_len(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   let declared = match rng.random_range(0..3) {
     0 => u64::MAX >> 1,
@@ -180,8 +182,10 @@ pub(super) async fn huge_len(ctx: &Ctx, rng: &mut Rng) -> Outcome {
     match conn.next_frame((Instant::now() + TRICKLE).min(deadline)).await {
       Ok(Next::Frame(frame)) if frame.opcode == 8 => {
         let code = close_code(&frame);
-        if !matches!(code, Some(1009 | 1002)) {
-          return fail(format!("close code {code:?}, expected [1009, 1002]"), &conn);
+        let mut codes = ctx.expect.too_big.clone();
+        codes.extend([1009, 1002]);
+        if !code.is_some_and(|el| codes.contains(&el)) {
+          return fail(format!("close code {code:?}, expected {codes:?}"), &conn);
         }
         break;
       }

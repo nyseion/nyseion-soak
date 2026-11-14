@@ -3,8 +3,8 @@ mod support;
 use rimu_soak::{
   conn::ConnOpts,
   rng::rng,
-  scenario::{Proto, 
-    Ctx, Limits, Outcome, Scenario,
+  scenario::{
+    Ctx, Limits, Outcome, Proto, Scenario,
     invalid::{InvalidCase, expected_codes, run_case},
     run,
   },
@@ -20,14 +20,17 @@ fn ctx(addr: SocketAddr) -> Ctx {
     limits: Limits::default(),
     opts: ConnOpts::default(),
     proto: Proto::Ws,
+    routes: Default::default(),
+    expect: Default::default(),
   }
 }
 
 #[test]
 fn expected_codes_follow_rfc_6455() {
-  assert_eq!(expected_codes(InvalidCase::BadUtf8), [1007]);
-  assert_eq!(expected_codes(InvalidCase::Oversized), [1009]);
-  assert_eq!(expected_codes(InvalidCase::Unmasked), [1002]);
+  assert_eq!(expected_codes(InvalidCase::BadUtf8, &[1009]), [1007]);
+  assert_eq!(expected_codes(InvalidCase::Oversized, &[1009]), [1009]);
+  assert_eq!(expected_codes(InvalidCase::Oversized, &[1009, 1008]), [1009, 1008]);
+  assert_eq!(expected_codes(InvalidCase::Unmasked, &[1009]), [1002]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

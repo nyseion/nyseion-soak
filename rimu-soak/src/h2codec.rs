@@ -51,10 +51,11 @@ pub fn opening(initial_window: Option<u32>) -> Vec<u8> {
   out
 }
 
-/// A request header block, every field a literal without indexing.
-pub fn header_block(method: &str, path: &str, extra: &[(&str, &str)]) -> Vec<u8> {
+/// A request header block for `authority`, every field a literal without indexing.
+pub fn header_block(authority: &str, method: &str, path: &str, extra: &[(&str, &str)]) -> Vec<u8> {
   let mut block = Vec::new();
-  let fields = [(":method", method), (":scheme", "http"), (":path", path), (":authority", "soak")];
+  let fields =
+    [(":method", method), (":scheme", "http"), (":path", path), (":authority", authority)];
   for (name, value) in fields.into_iter().chain(extra.iter().copied()) {
     block.push(0);
     string(&mut block, name.as_bytes());
@@ -63,8 +64,9 @@ pub fn header_block(method: &str, path: &str, extra: &[(&str, &str)]) -> Vec<u8>
   block
 }
 
-/// HEADERS (END_HEADERS) for a request.
+/// HEADERS (END_HEADERS) for a request to `authority`.
 pub fn request(
+  authority: &str,
   stream: u32,
   method: &str,
   path: &str,
@@ -72,7 +74,7 @@ pub fn request(
   end: bool,
 ) -> Vec<u8> {
   let flags = END_HEADERS | if end { END_STREAM } else { 0 };
-  frame(HEADERS, flags, stream, &header_block(method, path, extra))
+  frame(HEADERS, flags, stream, &header_block(authority, method, path, extra))
 }
 
 fn string(block: &mut Vec<u8>, bytes: &[u8]) {
@@ -195,7 +197,7 @@ fn read_integer(block: &[u8], prefix: u32) -> Option<(usize, &[u8])> {
 }
 
 /// Huffman decoding of digits only (RFC 7541 Appendix B): what a status code needs.
-fn huffman_digits(bytes: &[u8]) -> Option<String> {
+pub(crate) fn huffman_digits(bytes: &[u8]) -> Option<String> {
   let mut out = String::new();
   let (mut code, mut bits) = (0u32, 0u32);
   for byte in bytes {

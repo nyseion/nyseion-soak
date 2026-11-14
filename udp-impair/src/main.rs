@@ -349,7 +349,10 @@ impl Impair {
     }
     let late = |cond: bool, extra: u32| delay_us.wrapping_add(if cond { extra } else { 0 });
     Fate {
-      copies: [Some(late(first_late, first_extra)), duplicated.then(|| late(second_late, second_extra))],
+      copies: [
+        Some(late(first_late, first_extra)),
+        duplicated.then(|| late(second_late, second_extra)),
+      ],
     }
   }
 
@@ -544,7 +547,10 @@ mod tests {
     let client: SocketAddr = "127.0.0.1:5000".parse().unwrap();
     assert_eq!(remote.server(client), "10.0.0.7".parse::<std::net::IpAddr>().unwrap());
     assert!(remote.local(client, 3).is_unspecified());
-    assert!(Opts::parse(["--server-port", "1", "--server-ip", "x"].iter().map(|el| el.to_string())).is_err());
+    assert!(
+      Opts::parse(["--server-port", "1", "--server-ip", "x"].iter().map(|el| el.to_string()))
+        .is_err()
+    );
     assert_eq!((opts.params.drop, opts.params.delay_us), (0.05, 100));
     for bad in [&["--drop", "2"][..], &["--server-port", "1", "--nope", "1"], &[]] {
       assert!(Opts::parse(bad.iter().map(|el| el.to_string())).is_err());

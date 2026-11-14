@@ -5,8 +5,8 @@ mod support;
 use rimu_soak::{
   conn::ConnOpts,
   rng::rng,
-  scenario::{Proto, 
-    Ctx, Limits, Outcome, Scenario, Weights,
+  scenario::{
+    Ctx, Limits, Outcome, Proto, Scenario, Weights,
     attack::{UpgradeCase, run_upgrade_case},
     parse_weights, profile,
     resource::linger_verdict,
@@ -33,6 +33,8 @@ fn ctx(addr: SocketAddr) -> Ctx {
     },
     opts: ConnOpts::default(),
     proto: Proto::Ws,
+    routes: Default::default(),
+    expect: Default::default(),
   }
 }
 

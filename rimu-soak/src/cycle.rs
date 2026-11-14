@@ -118,6 +118,8 @@ pub struct Extended {
   pub stop_on_first: bool,
   /// After each cycle's recovery check, this many connections at once.
   pub burst: Option<u32>,
+  /// Memory a connection may cost the server, in KiB; `None` is 256 for WebSocket, 768 for HTTP/2.
+  pub per_conn_kib: Option<u64>,
 }
 
 /// A `Trend` if `values` (one per cycle, in KiB) rose in each of the last `cycles` cycles, by more
@@ -305,7 +307,7 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
       state.violation(0, Violation::PidGone);
       return finish(state);
     }
-    None => eprintln!("warning: no --pid, so the server is not monitored"),
+    None => eprintln!("warning: no --pid or --process-name, so the server is not monitored"),
   }
   let deadline = cfg.ext.max_time.map(|el| started + el);
   let probes =
@@ -378,7 +380,7 @@ pub async fn run(cfg: CycleConfig, out: &mut dyn Write) -> Summary {
     }
     if let Some(n) = cfg.fd_flood {
       let Some(monitor) = state.monitor.as_mut() else {
-        eprintln!("warning: the fd flood needs --pid; skipped");
+        eprintln!("warning: the fd flood needs --pid or --process-name; skipped");
         continue;
       };
       let found =
@@ -412,6 +414,7 @@ fn finish(mut state: State<'_>) -> Summary {
 }
 
 /// The mixed load, sampled once a second. `false` if the server is gone.
+#[allow(clippy::too_many_arguments, reason = "the cycle's whole state, passed once")]
 async fn mix(
   cfg: &CycleConfig,
   mut run: RunConfig,
@@ -435,7 +438,11 @@ async fn mix(
     slots: cfg.run.slots,
     large_inflight: 0,
     max_payload: cfg.run.ctx.limits.max_payload,
-    per_slot_kib: if cfg.run.ctx.proto == Proto::H2 { 768 } else { 256 },
+    per_slot_kib: cfg.ext.per_conn_kib.unwrap_or(if cfg.run.ctx.proto == Proto::H2 {
+      768
+    } else {
+      256
+    }),
   };
   let (mut streak, mut saturated, mut alive) = (0, false, true);
   // Whether the last second's probes showed the harness saturated.

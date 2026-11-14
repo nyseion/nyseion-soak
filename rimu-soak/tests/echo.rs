@@ -4,7 +4,7 @@ use rimu_soak::{
   conn::ConnOpts,
   rng::{rng, seed_for},
   runner::{Record, RunConfig, replay, replay_id, run_slots},
-  scenario::{Proto, Ctx, Limits, Outcome, Scenario, Weights, parse_weights, profile, run},
+  scenario::{Ctx, Limits, Outcome, Proto, Scenario, Weights, parse_weights, profile, run},
 };
 use std::{
   net::SocketAddr,
@@ -27,6 +27,8 @@ pub fn ctx(addr: SocketAddr) -> Ctx {
     },
     opts: ConnOpts::default(),
     proto: Proto::Ws,
+    routes: Default::default(),
+    expect: Default::default(),
   }
 }
 
@@ -40,7 +42,11 @@ fn weights_pick_matches_profile() {
   let want =
     f64::from(weights.0.iter().find(|el| el.0 == Scenario::Echo).unwrap().1) / f64::from(total);
   assert!((share - want).abs() < 0.01, "{share} vs {want}");
-  assert!(profile("baseline", Proto::Ws).is_some() && profile("storm", Proto::Ws).is_some() && profile("x", Proto::Ws).is_none());
+  assert!(
+    profile("baseline", Proto::Ws).is_some()
+      && profile("storm", Proto::Ws).is_some()
+      && profile("x", Proto::Ws).is_none()
+  );
 }
 
 #[test]

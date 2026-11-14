@@ -1,15 +1,15 @@
-//! A raw 1-RTT QUIC client (ruling T23-j #5). It drives a real TLS 1.3 handshake through
+//! A raw 1-RTT QUIC client. It drives a real TLS 1.3 handshake through
 //! `rustls::quic::ClientConnection` (ring provider) but keeps its own QUIC codecs: long/short
 //! headers, packet-number spaces, CRYPTO reassembly, the ACK writer, transport-parameter encoding
 //! and every frame encoder. rustls supplies only the handshake bytes and the per-level packet and
 //! header-protection keys ([`rustls::quic::Keys`]); the packet framing, the frames the floods
-//! inject, and the close-code parsing are the harness's own, so a bug the harness and rimu-ws share
-//! could not hide (ruling T23-b). rustls is not rimu-ws's TLS stack, so independence holds.
+//! inject, and the close-code parsing are the harness's own, so a bug the harness and the server
+//! shared could not hide.
 //!
 //! It exists for what `quinn` will not send: a conforming client emits no PING, PATH_CHALLENGE,
 //! NEW_CONNECTION_ID or RETIRE_CONNECTION_ID flood, no empty 1-RTT packet, no out-of-order STREAM
 //! gaps past the limit, no STREAM past the flow-control window and no 10,000-range ACK. Each of
-//! those is one of the server's documented limits (spec section 5.12).
+//! those is one of the server's documented limits.
 
 use crate::quic::raw::{put_varint, read_varint};
 use rustls::quic::{ClientConnection, DirectionalKeys, KeyChange, Keys, Version};
@@ -162,7 +162,7 @@ pub mod frames {
 
   /// An ACK frame of `ranges` extra ranges after the first, each gap 0 / length 0, walking down
   /// from `largest` by two (RFC 9000 section 19.3): every acknowledged packet number is a real one
-  /// the server sent, provided `largest >= 2 * ranges`. For the valid 257+ range flood (N1).
+  /// the server sent, provided `largest >= 2 * ranges`. For the valid 257+ range flood.
   pub fn ack_ranges(largest: u64, ranges: u64) -> Vec<u8> {
     let mut out = vec![0x02];
     put_varint(&mut out, largest);
@@ -346,7 +346,7 @@ pub struct OneRttClient {
   largest_recv: [Option<u64>; 3],
 }
 
-/// The outcome of a raw per-datagram flap (ruling T23-j #4 / N4).
+/// The outcome of a raw per-datagram flap.
 pub struct RawFlap {
   /// Datagrams sent (one per flip).
   pub flips: u64,
@@ -359,10 +359,11 @@ pub struct RawFlap {
 }
 
 impl OneRttClient {
-  /// Binds a loopback socket, runs the QUIC/TLS handshake against `target`, and returns once the
-  /// 1-RTT keys are in hand (or an error / timeout).
-  pub async fn connect(target: SocketAddr) -> Result<OneRttClient, String> {
-    let bind: &str = if target.is_ipv6() { "[::1]:0" } else { "127.0.0.1:0" };
+  /// Binds a socket (on loopback for a loopback target), runs the QUIC/TLS handshake against
+  /// `target` with `server_name` for SNI, and returns once the 1-RTT keys are in hand (or an error
+  /// / timeout).
+  pub async fn connect(target: SocketAddr, server_name: &str) -> Result<OneRttClient, String> {
+    let bind = crate::quic::client::local_bind(target, 1);
     let sock = UdpSocket::bind(bind).await.map_err(|err| format!("bind: {err}"))?;
     sock.connect(target).await.map_err(|err| format!("connect: {err}"))?;
 
@@ -373,7 +374,8 @@ impl OneRttClient {
     let mut conn = ClientConnection::new(
       std::sync::Arc::new(super::client::rustls_config()),
       Version::V1,
-      rustls::pki_types::ServerName::try_from("localhost").map_err(|err| format!("name: {err}"))?,
+      rustls::pki_types::ServerName::try_from(server_name.to_owned())
+        .map_err(|err| format!("name: {err}"))?,
       transport_params(&scid),
     )
     .map_err(|err| format!("rustls client: {err}"))?;
@@ -471,11 +473,11 @@ impl OneRttClient {
         return Err("handshake timed out".into());
       }
       let datagram = buf[..len].to_vec();
-      if server_scid.is_none() {
-        if let Some(scid) = long_header_scid(&datagram) {
-          server_scid = Some(scid.clone());
-          client.dcid = scid; // our packets now go to the server's chosen CID.
-        }
+      if server_scid.is_none()
+        && let Some(scid) = long_header_scid(&datagram)
+      {
+        server_scid = Some(scid.clone());
+        client.dcid = scid; // our packets now go to the server's chosen CID.
       }
       datagrams.push(datagram);
     }
@@ -548,7 +550,7 @@ impl OneRttClient {
       let Some(&first) = datagram.get(at) else { break };
       if first & 0x80 == 0 {
         // Short header (1-RTT): its DCID is our own connection ID (the SCID we chose), so the
-        // packet-number offset skips that length (N7). Runs to the end of the datagram.
+        // packet-number offset skips that length. Runs to the end of the datagram.
         if let Some(res) = self.decode_one(ONE_RTT, &datagram[at..], 1 + self.scid.len()) {
           out.push(res);
         }
@@ -645,7 +647,7 @@ impl OneRttClient {
     self.largest_recv[ONE_RTT]
   }
 
-  /// A per-datagram migration flapper that sends no PING (ruling T23-j #4 / N4): one MAX_DATA
+  /// A per-datagram migration flapper that sends no PING: one MAX_DATA
   /// packet per datagram, alternating between the handshake socket (address 0, validated) and
   /// `alt` (address 1, perpetually unvalidated). Both sockets must be connected to the server.
   /// Counts bytes in and out per address and records the close, so a 3× amplification check can be
@@ -882,40 +884,5 @@ mod tests {
     let suite = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256.tls13().unwrap();
     let algo = suite.quic.unwrap();
     Keys::initial(Version::V1, suite, algo, dcid, rustls::Side::Server).into()
-  }
-
-  // A live smoke test of the whole handshake and the PING flood against a soak-server-h3 on
-  // 127.0.0.1:8443 (ignored by default: run with the server up, `cargo test ... -- --ignored
-  // smoke_handshake`). Confirms the raw 1-RTT client completes the TLS handshake and that a PING
-  // flood draws H3_EXCESSIVE_LOAD (App 0x0107).
-  #[tokio::test]
-  #[ignore = "needs a running soak-server-h3 on 127.0.0.1:8443"]
-  async fn smoke_handshake_and_ping_flood() {
-    let target = "127.0.0.1:8443".parse().unwrap();
-    let mut client = OneRttClient::connect(target).await.expect("handshake");
-    for _ in 0..40u32 {
-      client.send_1rtt(&frames::pings(1200)).await.expect("send");
-    }
-    let close = client.wait_close(Duration::from_secs(3)).await;
-    eprintln!("smoke close = {close:?}");
-    assert_eq!(close, Close::App(0x0107));
-  }
-
-  // Runs the whole 1-RTT flood battery against a live soak-server-h3 on 127.0.0.1:8443 and prints
-  // each result (ignored by default). A quick way to validate every close code without the full
-  // soak harness.
-  #[tokio::test]
-  #[ignore = "needs a running soak-server-h3 on 127.0.0.1:8443"]
-  async fn smoke_all_floods() {
-    let target = "127.0.0.1:8443".parse().unwrap();
-    let results = crate::quic::scenario::onertt_floods(target).await;
-    let mut failed = Vec::new();
-    for r in &results {
-      eprintln!("{} pass={} — {}", r.name, r.pass, r.detail);
-      if !r.pass {
-        failed.push(r.name.clone());
-      }
-    }
-    assert!(failed.is_empty(), "failed: {failed:?}");
   }
 }

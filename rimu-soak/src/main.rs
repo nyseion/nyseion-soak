@@ -1,14 +1,18 @@
-//! `rimu-soak run ...` soaks a server; `rimu-soak replay SEED:SLOT:GEN ...` reruns one
-//! scenario run alone and prints its transcript.
+//! `rimu-soak run ...` soaks a WebSocket or HTTP/2 server; `rimu-soak h3 ...` an HTTP/3 one;
+//! `rimu-soak replay SEED:SLOT:GEN ...` reruns one scenario run alone and prints its transcript;
+//! `rimu-soak list` prints the scenarios and profiles.
 
 use clap::Parser as _;
 use rimu_soak::{
   conn::ConnOpts,
   cycle::{self, CycleConfig, Extended, RecordMode},
+  monitor::find_pid,
+  quic::driver::{H3Config, H3Policy},
   runner::{RunConfig, parse_replay, replay},
-  scenario::{Ctx, Limits, Proto, Weights, parse_weights, profile},
+  scenario::{Ctx, Expect, Limits, Proto, Routes, Scenario, Weights, parse_weights, profile},
 };
 use std::{
+  io::Write,
   net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as _},
   path::PathBuf,
   process::ExitCode,
@@ -16,8 +20,14 @@ use std::{
 };
 
 #[derive(clap::Parser)]
-// A later occurrence of an option overrides an earlier one: `soak.sh long` puts its defaults first.
-#[command(about = "Soak and abuse harness for WebSocket servers", args_override_self = true)]
+// A later occurrence of an option overrides an earlier one, so a wrapper script's defaults can come
+// first.
+#[command(
+  name = "rimu-soak",
+  version,
+  about = "Soak and abuse harness for WebSocket, HTTP/2 and HTTP/3 servers",
+  args_override_self = true
+)]
 struct Cli {
   #[command(subcommand)]
   cmd: Cmd,
@@ -25,63 +35,120 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Cmd {
-  /// Runs client slots against the server.
-  Run(RunArgs),
+  /// Soaks a WebSocket (`--proto ws`) or cleartext HTTP/2 (`--proto h2`) server: client slots run
+  /// weighted scenarios while a monitor and latency probes judge the server.
+  Run(Box<RunArgs>),
   /// Reruns one scenario run by its replay id and prints its record and transcript.
-  Replay(ReplayArgs),
-  /// Soaks an HTTP/3 server: a steady client plus the abusive QUIC/HTTP/3 clients (task 23).
-  H3(H3Args),
+  Replay(Box<ReplayArgs>),
+  /// Soaks an HTTP/3 server: steady clients beside abusive QUIC/HTTP/3 clients.
+  H3(Box<H3Args>),
+  /// Lists the scenarios and profiles.
+  List,
 }
 
+/// Where the server runs and how to find it.
 #[derive(clap::Args)]
-struct H3Args {
-  /// The multi-worker h3 server, as `https://127.0.0.1:8443`.
-  #[arg(long, default_value = "https://127.0.0.1:8443")]
-  url: String,
-  /// The server's pid, for the monitor.
-  #[arg(long)]
+struct Server {
+  /// The server's pid, for the monitor (memory, descriptors, CPU, socket states). Without it or
+  /// `--process-name`, the server is not monitored.
+  #[arg(long, conflicts_with = "process_name")]
   pid: Option<u32>,
-  /// A one-worker h3 server for the per-worker caps (idle × 4,096), as `https://127.0.0.1:8444`.
+  /// The server's process name (its command name or executable file name), which must match
+  /// exactly one process; an alternative to `--pid`.
   #[arg(long)]
-  idle_url: Option<String>,
-  /// The one-worker server's pid.
-  #[arg(long)]
-  idle_pid: Option<u32>,
-  /// The whole run (steady plus abusers).
-  #[arg(long, default_value = "600s", value_parser = parse_duration)]
-  duration: Duration,
-  /// Probe-only time at the start that sets the RSS plateau.
-  #[arg(long, default_value = "30s", value_parser = parse_duration)]
-  warmup: Duration,
-  /// Steady connections.
-  #[arg(long, default_value_t = 64)]
-  conns: u32,
-  /// Streams per steady connection.
-  #[arg(long, default_value_t = 64)]
-  streams: u32,
-  /// The multi-worker server's worker count, for the report.
-  #[arg(long, default_value_t = 4)]
-  workers: u32,
-  /// JSONL output; defaults to /mnt/nvme1tb/claude-tmp/soak/h3-soak.jsonl.
+  process_name: Option<String>,
+}
+
+impl Server {
+  fn resolve(&self) -> Result<Option<u32>, String> {
+    match (&self.pid, &self.process_name) {
+      (Some(pid), _) => Ok(Some(*pid)),
+      (None, Some(name)) => find_pid(name).map(Some),
+      (None, None) => Ok(None),
+    }
+  }
+}
+
+/// How results are written.
+#[derive(clap::Args)]
+struct Output {
+  /// Writes every sample, record and violation as JSON lines to this file.
   #[arg(long)]
   out: Option<PathBuf>,
+  /// Prints the final summary as one JSON object on standard output.
+  #[arg(long)]
+  json: bool,
+}
+
+impl Output {
+  fn writer(&self) -> Result<Box<dyn Write>, String> {
+    let Some(path) = &self.out else { return Ok(Box::new(std::io::sink())) };
+    if let Some(dir) = path.parent().filter(|el| !el.as_os_str().is_empty()) {
+      std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    }
+    let file = std::fs::File::create(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    Ok(Box::new(std::io::BufWriter::new(file)))
+  }
+}
+
+/// The HTTP routes the HTTP/2 and HTTP/3 scenarios use.
+#[derive(clap::Args)]
+struct RouteArgs {
+  /// A route whose `GET` answers 200 with `--ok-body`.
+  #[arg(long, default_value = "/baseline2")]
+  ok_path: String,
+  #[arg(long, default_value = "ok")]
+  ok_body: String,
+  /// A route whose `POST` answers 200 with the request body (HTTP/2 only).
+  #[arg(long, default_value = "/echo")]
+  echo_path: String,
+  /// A route whose `GET` answers 200 with a large body, for the slow and absent readers.
+  #[arg(long, default_value = "/static/big.bin")]
+  big_path: String,
+  /// The size of the large body in bytes.
+  #[arg(long, default_value_t = 10 << 20)]
+  big_len: usize,
+  /// Whether byte `i` of the large body is `i % 251`, which the slow readers then check.
+  #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+  big_pattern: bool,
+}
+
+impl RouteArgs {
+  fn routes(&self) -> Routes {
+    Routes {
+      ok_path: self.ok_path.clone(),
+      ok_body: self.ok_body.clone(),
+      echo_path: self.echo_path.clone(),
+      big_path: self.big_path.clone(),
+      big_len: self.big_len,
+      big_pattern: self.big_pattern,
+    }
+  }
 }
 
 #[derive(clap::Args)]
 struct Common {
-  /// The server's WebSocket URL (plain `ws://` only), or with `--proto h2` its `http://` URL.
+  /// The server's URL: `ws://HOST:PORT/PATH` for WebSocket (plain, no TLS), `http://HOST:PORT`
+  /// with `--proto h2`.
   #[arg(long, default_value = "ws://127.0.0.1:9080/")]
   url: String,
   /// The protocol the server speaks: WebSocket, or HTTP/2 without TLS (prior knowledge).
   #[arg(long, value_enum, default_value_t = Proto::Ws)]
   proto: Proto,
-  /// Weighted mix: `baseline`, `hostile`, `storm`, `untimed`, `drip` or `deflate`. A comma
-  /// list (`hostile,storm`) rotates them by cycle; replay with the failing cycle's profile.
+  /// The `Host` header (WebSocket) or `:authority` (HTTP/2); defaults to the URL's authority.
+  #[arg(long)]
+  host: Option<String>,
+  /// Weighted mix: `baseline`, `hostile`, `attack`, `storm`, `untimed`, `drip` (WebSocket), or
+  /// `baseline`, `hostile`, `attack`, `storm` (HTTP/2). A comma list (`hostile,storm`) rotates
+  /// them by cycle; replay with the failing cycle's profile.
   #[arg(long, default_value = "hostile")]
   profile: String,
   /// Overrides `--profile`, as `echo=40,garbage=4`.
-  #[arg(long)]
+  #[arg(long, conflicts_with = "only")]
   weights: Option<String>,
+  /// Overrides `--profile`: these scenarios, equally weighted, as `echo,invalid`.
+  #[arg(long, value_delimiter = ',')]
+  only: Option<Vec<Scenario>>,
   /// The server's handshake (first write) timeout.
   #[arg(long, default_value = "2s", value_parser = parse_duration)]
   handshake_timeout: Duration,
@@ -91,24 +158,35 @@ struct Common {
   /// The server's close timeout.
   #[arg(long, default_value = "2s", value_parser = parse_duration)]
   close_timeout: Duration,
-  /// The server's largest message.
+  /// The server's largest WebSocket message.
   #[arg(long, default_value_t = 1 << 20)]
   max_payload: u64,
   /// The server's SO_SNDBUF (at most 32 KiB), which `close_linger` needs; without it, that
   /// scenario is left out.
   #[arg(long)]
   server_sndbuf: Option<u32>,
+  /// WebSocket close codes accepted for a message over the limit (RFC 6455 names 1009).
+  #[arg(long, value_delimiter = ',', default_value = "1009")]
+  too_big_codes: Vec<u16>,
+  /// HTTP/2 GOAWAY codes accepted for the rapid reset, SETTINGS and PING floods (ENHANCE_YOUR_CALM
+  /// is 11); `any` accepts every error code.
+  #[arg(long, value_delimiter = ',', default_value = "11", value_parser = parse_calm)]
+  h2_calm_codes: Vec<Option<u32>>,
+  #[command(flatten)]
+  routes: RouteArgs,
 }
 
 #[derive(clap::Args)]
 struct RunArgs {
   #[command(flatten)]
   common: Common,
-  /// The server's pid, for the monitor.
-  #[arg(long)]
-  pid: Option<u32>,
+  #[command(flatten)]
+  server: Server,
+  #[command(flatten)]
+  output: Output,
   #[arg(long, default_value_t = 1)]
   seed: u64,
+  /// Concurrent client slots, each running scenario after scenario.
   #[arg(long, default_value_t = 100)]
   slots: u32,
   /// Length of each cycle's mixed load.
@@ -127,12 +205,9 @@ struct RunArgs {
   probes: u32,
   #[arg(long, default_value_t = 100)]
   probe_rate: u32,
-  /// After each cycle's drain, open this many connections and hold them (needs --pid).
+  /// After each cycle's drain, open this many connections and hold them (needs the monitor).
   #[arg(long)]
   fd_flood: Option<u32>,
-  /// JSONL output; defaults to /mnt/nvme1tb/claude-tmp/soak/soak-<seed>.jsonl.
-  #[arg(long)]
-  out: Option<PathBuf>,
   /// Source addresses to spread the slots over, as `a-b` ranges or a comma list.
   #[arg(long)]
   source_ips: Option<String>,
@@ -146,7 +221,7 @@ struct RunArgs {
   /// all) before that is a violation. 0 turns the check off.
   #[arg(long, default_value_t = 0)]
   trend: u32,
-  /// Kills the server past this RSS in MiB (needs --pid), which ends the run.
+  /// Kills the server past this RSS in MiB (needs the monitor), which ends the run.
   #[arg(long)]
   rss_ceiling: Option<u64>,
   /// Starts no cycle, and stops the load, this long into the run.
@@ -159,6 +234,10 @@ struct RunArgs {
   /// and echo within 5 s.
   #[arg(long)]
   burst: Option<u32>,
+  /// Memory one connection may cost the server, in KiB, in the RSS limit (default 256 for
+  /// WebSocket, 768 for HTTP/2).
+  #[arg(long)]
+  per_conn_kib: Option<u64>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -175,6 +254,80 @@ struct ReplayArgs {
   id: String,
 }
 
+#[derive(clap::Args)]
+struct H3Args {
+  /// The (multi-worker) HTTP/3 server, as `https://127.0.0.1:8443`.
+  #[arg(long, default_value = "https://127.0.0.1:8443")]
+  url: String,
+  #[command(flatten)]
+  server: Server,
+  /// A one-worker instance of the server, as `https://127.0.0.1:8444`, for the per-worker cap
+  /// (`idle_cap`) and the CPU-attributed raw floods.
+  #[arg(long)]
+  idle_url: Option<String>,
+  /// The one-worker server's pid.
+  #[arg(long, conflicts_with = "idle_process_name")]
+  idle_pid: Option<u32>,
+  /// The one-worker server's process name.
+  #[arg(long)]
+  idle_process_name: Option<String>,
+  #[command(flatten)]
+  output: Output,
+  /// The whole run (steady clients plus abusers).
+  #[arg(long, default_value = "600s", value_parser = parse_duration)]
+  duration: Duration,
+  /// Steady-only time at the start that sets the RSS plateau.
+  #[arg(long, default_value = "30s", value_parser = parse_duration)]
+  warmup: Duration,
+  /// Steady connections.
+  #[arg(long, default_value_t = 64)]
+  conns: u32,
+  /// Streams per steady connection.
+  #[arg(long, default_value_t = 64)]
+  streams: u32,
+  /// The main server's worker count, for the report.
+  #[arg(long, default_value_t = 4)]
+  workers: u32,
+  /// SNI and `:authority` (the certificate is not checked).
+  #[arg(long, default_value = "localhost")]
+  server_name: String,
+  #[command(flatten)]
+  routes: RouteArgs,
+  /// Only these scenarios (see `rimu-soak list`), as `reset_churn,qpack_flood`.
+  #[arg(long, value_delimiter = ',', conflicts_with = "skip")]
+  scenarios: Option<Vec<String>>,
+  /// Every scenario but these.
+  #[arg(long, value_delimiter = ',')]
+  skip: Option<Vec<String>>,
+  /// The application close code for a client over a rate budget (H3_EXCESSIVE_LOAD is 0x0107).
+  #[arg(long, default_value = "0x0107", value_parser = parse_u64)]
+  excessive_load_code: u64,
+  /// The bidirectional streams the server allows a client at once.
+  #[arg(long, default_value_t = 256)]
+  max_bidi_streams: u32,
+  /// Replies the server may send per second to unknown connection IDs (stateless resets).
+  #[arg(long, default_value_t = 100)]
+  stateless_reset_rate: u32,
+  /// The server's idle timeout.
+  #[arg(long, default_value = "30s", value_parser = parse_duration)]
+  server_idle_timeout: Duration,
+  /// The per-stream receive window the server grants, in bytes.
+  #[arg(long, default_value_t = 1 << 20)]
+  stream_window: u64,
+  /// Connections one worker accepts.
+  #[arg(long, default_value_t = 4096)]
+  conns_per_worker: u32,
+  /// Whether `initial_flood` must draw a Retry (address validation is optional in RFC 9000).
+  #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+  expect_retry: bool,
+  /// A route answering the server's live heap bytes as a decimal number, for `idle_cap`.
+  #[arg(long)]
+  mem_path: Option<String>,
+  /// A route answering the server's own connection report, for `idle_cap`'s detail.
+  #[arg(long)]
+  stats_path: Option<String>,
+}
+
 fn parse_duration(s: &str) -> Result<Duration, String> {
   let (num, unit) = s.find(|el: char| !el.is_ascii_digit()).map_or((s, "s"), |at| s.split_at(at));
   let num: u64 = num.parse().map_err(|_| format!("bad duration `{s}`"))?;
@@ -185,6 +338,21 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     "h" => Ok(Duration::from_secs(num * 3600)),
     _ => Err(format!("bad duration unit in `{s}`")),
   }
+}
+
+fn parse_u64(s: &str) -> Result<u64, String> {
+  match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+    Some(hex) => u64::from_str_radix(hex, 16),
+    None => s.parse(),
+  }
+  .map_err(|_| format!("bad number `{s}`"))
+}
+
+fn parse_calm(s: &str) -> Result<Option<u32>, String> {
+  if s == "any" {
+    return Ok(None);
+  }
+  parse_u64(s)?.try_into().map(Some).map_err(|_| format!("bad code `{s}`"))
 }
 
 fn parse_ips(s: &str) -> Result<Vec<IpAddr>, String> {
@@ -201,8 +369,11 @@ fn parse_ips(s: &str) -> Result<Vec<IpAddr>, String> {
   Ok(ips)
 }
 
+/// Profiles by name, rotated by cycle.
+type Rotation = Vec<(String, Weights)>;
+
 /// The context, the first profile's weights, and every profile when `--profile` lists several.
-fn ctx(common: &Common) -> Result<(Ctx, Weights, Vec<(String, Weights)>), String> {
+fn ctx(common: &Common) -> Result<(Ctx, Weights, Rotation), String> {
   let scheme = if common.proto == Proto::H2 { "http://" } else { "ws://" };
   let rest =
     common.url.strip_prefix(scheme).ok_or_else(|| format!("only {scheme} URLs are supported"))?;
@@ -213,9 +384,15 @@ fn ctx(common: &Common) -> Result<(Ctx, Weights, Vec<(String, Weights)>), String
     .next()
     .ok_or_else(|| format!("{authority} resolves to nothing"))?;
   let mut rotation = Vec::new();
-  let weights = match &common.weights {
-    Some(spec) => parse_weights(spec)?,
-    None => {
+  let weights = match (&common.weights, &common.only) {
+    (Some(spec), _) => parse_weights(spec)?,
+    (None, Some(only)) => {
+      if only.is_empty() {
+        return Err("--only needs a scenario".into());
+      }
+      Weights(only.iter().map(|el| (*el, 1)).collect())
+    }
+    (None, None) => {
       for name in common.profile.split(',').map(str::trim) {
         let weights =
           profile(name, common.proto).ok_or_else(|| format!("unknown profile {name}"))?;
@@ -244,19 +421,22 @@ fn ctx(common: &Common) -> Result<(Ctx, Weights, Vec<(String, Weights)>), String
     .into_iter()
     .map(|(name, weights)| Ok((name, weights.for_limits(&limits)?)))
     .collect::<Result<Vec<_>, String>>()?;
-  let host = authority.to_owned();
-  Ok((
-    Ctx {
-      addr,
-      host,
-      path: path.to_owned(),
-      limits,
-      opts: ConnOpts::default(),
-      proto: common.proto,
-    },
-    weights,
-    rotation,
-  ))
+  let h2_calm = if common.h2_calm_codes.contains(&None) {
+    Vec::new()
+  } else {
+    common.h2_calm_codes.iter().flatten().copied().collect()
+  };
+  let ctx = Ctx {
+    addr,
+    host: common.host.clone().unwrap_or_else(|| authority.to_owned()),
+    path: path.to_owned(),
+    limits,
+    opts: ConnOpts::default(),
+    proto: common.proto,
+    routes: common.routes.routes(),
+    expect: Expect { too_big: common.too_big_codes.clone(), h2_calm },
+  };
+  Ok((ctx, weights, rotation))
 }
 
 /// Raises the descriptor limit to its hard limit: every slot holds a socket or two.
@@ -275,9 +455,13 @@ fn main() -> ExitCode {
   raise_nofile();
   let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
   let rslt = match cli.cmd {
-    Cmd::Run(args) => runtime.block_on(run(args)),
-    Cmd::Replay(args) => runtime.block_on(replay_one(args)),
-    Cmd::H3(args) => runtime.block_on(run_h3(args)),
+    Cmd::Run(args) => runtime.block_on(run(*args)),
+    Cmd::Replay(args) => runtime.block_on(replay_one(*args)),
+    Cmd::H3(args) => runtime.block_on(run_h3(*args)),
+    Cmd::List => {
+      list();
+      Ok(ExitCode::SUCCESS)
+    }
   };
   rslt.unwrap_or_else(|err| {
     eprintln!("error: {err}");
@@ -285,18 +469,42 @@ fn main() -> ExitCode {
   })
 }
 
+fn list() {
+  use clap::ValueEnum as _;
+  let names = |h2: bool| -> Vec<String> {
+    Scenario::value_variants()
+      .iter()
+      .filter_map(|el| el.to_possible_value())
+      .map(|el| el.get_name().to_owned())
+      .filter(|el| el.starts_with("h2_") == h2)
+      .collect()
+  };
+  println!("WebSocket scenarios (run --proto ws):\n  {}", names(false).join(" "));
+  println!("HTTP/2 scenarios (run --proto h2):\n  {}", names(true).join(" "));
+  println!("HTTP/3 scenarios (h3):\n  {}", rimu_soak::quic::scenario::ALL.join(" "));
+  for (proto, label, profiles) in [
+    (Proto::Ws, "WebSocket", &["baseline", "hostile", "attack", "storm", "untimed", "drip"][..]),
+    (Proto::H2, "HTTP/2", &["baseline", "hostile", "attack", "storm"][..]),
+  ] {
+    println!("{label} profiles:");
+    for name in profiles {
+      let weights = profile(name, proto).map(|el| el.0).unwrap_or_default();
+      let spec: Vec<String> = weights
+        .iter()
+        .filter_map(|(scenario, weight)| {
+          Some(format!("{}={weight}", scenario.to_possible_value()?.get_name()))
+        })
+        .collect();
+      println!("  {name}: {}", spec.join(","));
+    }
+  }
+}
+
 async fn run(args: RunArgs) -> Result<ExitCode, String> {
   let (ctx, weights, rotation) = ctx(&args.common)?;
+  let pid = args.server.resolve()?;
   let source_ips = args.source_ips.as_deref().map(parse_ips).transpose()?.unwrap_or_default();
-  let out_path = args
-    .out
-    .unwrap_or_else(|| format!("/mnt/nvme1tb/claude-tmp/soak/soak-{}.jsonl", args.seed).into());
-  if let Some(dir) = out_path.parent() {
-    std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
-  }
-  let mut out = std::io::BufWriter::new(
-    std::fs::File::create(&out_path).map_err(|err| format!("{}: {err}", out_path.display()))?,
-  );
+  let mut out = args.output.writer()?;
   let port = ctx.addr.port();
   let cfg = CycleConfig {
     run: RunConfig {
@@ -307,7 +515,7 @@ async fn run(args: RunArgs) -> Result<ExitCode, String> {
       ctx,
       source_ips,
     },
-    pid: args.pid,
+    pid,
     port,
     cycles: args.cycles,
     warmup: args.warmup,
@@ -327,11 +535,13 @@ async fn run(args: RunArgs) -> Result<ExitCode, String> {
       max_time: args.max_time,
       stop_on_first: args.stop_on_first,
       burst: args.burst,
+      per_conn_kib: args.per_conn_kib,
     },
   };
   let summary = cycle::run(cfg, &mut out).await;
+  out.flush().map_err(|err| format!("--out: {err}"))?;
   eprintln!(
-    "cycles {}, records {}, fails {}, harness errors {}, violations {}, saturated cycles {}; probe p50/p99/p99.9/max {}/{}/{}/{} us{}; {}",
+    "cycles {}, records {}, fails {}, harness errors {}, violations {}, saturated cycles {}; probe p50/p99/p99.9/max {}/{}/{}/{} us{}",
     summary.cycles,
     summary.records,
     summary.fails,
@@ -343,15 +553,23 @@ async fn run(args: RunArgs) -> Result<ExitCode, String> {
     summary.latency.p999_us,
     summary.latency.max_us,
     summary.stopped.as_deref().map(|el| format!("; stopped: {el}")).unwrap_or_default(),
-    out_path.display()
   );
-  Ok(ExitCode::from(if summary.fails > 0 || !summary.violations.is_empty() {
+  let code = if summary.fails > 0 || !summary.violations.is_empty() {
     1
   } else if summary.harness_errors > 0 {
     2
   } else {
     0
-  }))
+  };
+  if args.output.json {
+    let mut json = serde_json::to_value(&summary).map_err(|err| err.to_string())?;
+    if let Some(map) = json.as_object_mut() {
+      let _ = map.insert("pass".into(), (code == 0).into());
+      let _ = map.insert("exit_code".into(), code.into());
+    }
+    println!("{json}");
+  }
+  Ok(ExitCode::from(code))
 }
 
 async fn replay_one(args: ReplayArgs) -> Result<ExitCode, String> {
@@ -384,7 +602,8 @@ fn parse_h3_url(url: &str) -> Result<SocketAddr, String> {
     .ok_or_else(|| format!("{authority} resolves to nothing"))
 }
 
-/// The soft `RLIMIT_MEMLOCK` in KiB, or `None` when it is unlimited (ruling T23-d).
+/// The soft `RLIMIT_MEMLOCK` in KiB, or `None` when it is unlimited, for the report: io_uring
+/// servers need locked memory.
 fn memlock_kib() -> Option<u64> {
   let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
   // SAFETY: valid out pointer
@@ -397,29 +616,55 @@ fn memlock_kib() -> Option<u64> {
 async fn run_h3(args: H3Args) -> Result<ExitCode, String> {
   let main_addr = parse_h3_url(&args.url)?;
   let idle_addr = args.idle_url.as_deref().map(parse_h3_url).transpose()?;
-  let out_path = args.out.unwrap_or_else(|| "/mnt/nvme1tb/claude-tmp/soak/h3-soak.jsonl".into());
-  if let Some(dir) = out_path.parent() {
-    std::fs::create_dir_all(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+  let main_pid = args.server.resolve()?;
+  let idle_pid =
+    Server { pid: args.idle_pid, process_name: args.idle_process_name.clone() }.resolve()?;
+  let all = rimu_soak::quic::scenario::ALL;
+  let scenarios = match (&args.scenarios, &args.skip) {
+    (Some(only), _) => Some(only.clone()),
+    (None, Some(skip)) => Some(
+      all.iter().filter(|el| !skip.iter().any(|s| s == *el)).map(|el| (*el).to_owned()).collect(),
+    ),
+    (None, None) => None,
+  };
+  for name in scenarios.iter().flatten().chain(args.skip.iter().flatten()) {
+    if !all.contains(&name.as_str()) {
+      return Err(format!("unknown h3 scenario `{name}` (see `rimu-soak list`)"));
+    }
   }
-  let mut out = std::io::BufWriter::new(
-    std::fs::File::create(&out_path).map_err(|err| format!("{}: {err}", out_path.display()))?,
-  );
-  let cfg = rimu_soak::quic::driver::H3Config {
+  let policy = H3Policy {
+    server_name: args.server_name.clone(),
+    routes: args.routes.routes(),
+    excessive_load: args.excessive_load_code,
+    max_bidi_streams: args.max_bidi_streams,
+    stateless_reset_per_sec: args.stateless_reset_rate,
+    idle_timeout: args.server_idle_timeout,
+    stream_window: args.stream_window,
+    conns_per_worker: args.conns_per_worker,
+    expect_retry: args.expect_retry,
+    mem_path: args.mem_path.clone(),
+    stats_path: args.stats_path.clone(),
+    scenarios,
+  };
+  let mut out = args.output.writer()?;
+  let cfg = H3Config {
     main_addr,
-    main_pid: args.pid,
+    main_pid,
     idle_addr,
-    idle_pid: args.idle_pid,
+    idle_pid,
     duration: args.duration,
     warmup: args.warmup,
     conns: args.conns,
     streams: args.streams,
-    out: out_path.clone(),
     main_workers: args.workers,
     memlock_kib: memlock_kib(),
+    policy,
   };
-  let fails = rimu_soak::quic::driver::run(cfg, &mut out).await;
-  use std::io::Write as _;
-  out.flush().map_err(|err| format!("{}: {err}", out_path.display()))?;
-  eprintln!("h3 soak: {fails} failures; {}", out_path.display());
-  Ok(ExitCode::from(if fails > 0 { 1 } else { 0 }))
+  let report = rimu_soak::quic::driver::run(cfg, &mut out).await;
+  out.flush().map_err(|err| format!("--out: {err}"))?;
+  eprintln!("h3 soak: {} failures", report.fails);
+  if args.output.json {
+    println!("{}", serde_json::to_string(&report).map_err(|err| err.to_string())?);
+  }
+  Ok(ExitCode::from(if report.fails > 0 { 1 } else { 0 }))
 }

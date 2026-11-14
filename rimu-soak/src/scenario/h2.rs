@@ -1,6 +1,7 @@
-//! HTTP/2 clients against `soak-server-h2`: steady traffic with checked bodies, and the attacks
+//! HTTP/2 clients (cleartext, prior knowledge): steady traffic with checked bodies, and the attacks
 //! and resource abuse an HTTP/2 server meets (rapid reset, CONTINUATION, SETTINGS and PING
 //! floods, slow and absent readers, starved windows, half-open connections, oversized messages).
+//! The routes they use are [`super::Routes`].
 
 use super::{Ctx, Outcome, fail, from_err, slack};
 use crate::{
@@ -19,10 +20,6 @@ use tokio::time::{Instant, sleep};
 const RESPONSE: Duration = Duration::from_secs(5);
 /// How long a server may take to close once it has every reason to.
 const CLOSE: Duration = Duration::from_secs(2);
-/// ENHANCE_YOUR_CALM.
-const CALM: u32 = 11;
-/// The size of `/static/big.bin`.
-const BIG: usize = 10 << 20;
 
 async fn open(ctx: &Ctx, opts: &ConnOpts, initial_window: Option<u32>) -> Result<H2, Outcome> {
   let conn = Conn::connect(ctx.addr, opts).await.map_err(|err| from_err(err, None))?;
@@ -33,14 +30,15 @@ fn h2_fail(reason: impl Into<String>, h2: &H2) -> Outcome {
   fail(reason, &h2.conn)
 }
 
-/// Byte `i` of a soak static file.
-fn static_byte(idx: usize) -> u8 {
+/// Byte `i` of the large file, when the server serves the pattern file (`Routes::big_pattern`).
+pub fn static_byte(idx: usize) -> u8 {
   (idx % 251) as u8
 }
 
-/// One connection, 100 streams in batches of 25: `GET /baseline2` answers `ok`, `POST /echo` its
-/// body (up to 2 KiB, so a batch stays within the initial windows).
+/// One connection, 100 streams in batches of 25: `GET` of the ok route answers its body, `POST` to
+/// the echo route its body (up to 2 KiB, so a batch stays within the initial windows).
 pub(super) async fn steady(ctx: &Ctx, rng: &mut Rng) -> Outcome {
+  let r = &ctx.routes;
   let mut h2 = match open(ctx, &ctx.opts, None).await {
     Ok(elem) => elem,
     Err(outcome) => return outcome,
@@ -51,11 +49,11 @@ pub(super) async fn steady(ctx: &Ctx, rng: &mut Rng) -> Outcome {
     let mut expected = Vec::new();
     for _ in 0..25 {
       if rng.random_bool(0.5) {
-        bytes.extend(request(id, "GET", "/baseline2", &[], true));
-        expected.push((id, b"ok".to_vec()));
+        bytes.extend(request(&ctx.host, id, "GET", &r.ok_path, &[], true));
+        expected.push((id, r.ok_body.clone().into_bytes()));
       } else {
         let body: Vec<u8> = (0..rng.random_range(1..=2048)).map(|_| rng.random()).collect();
-        bytes.extend(request(id, "POST", "/echo", &[], false));
+        bytes.extend(request(&ctx.host, id, "POST", &r.echo_path, &[], false));
         bytes.extend(frame(DATA, END_STREAM, id, &body));
         expected.push((id, body));
       }
@@ -89,9 +87,10 @@ pub(super) async fn steady(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   Outcome::Pass
 }
 
-/// Sends `bytes` (a flood), then expects GOAWAY with `code` and the close. A send that fails
-/// halfway means the server closed already, which still has to show its GOAWAY.
-async fn flood(ctx: &Ctx, bytes: &[u8], code: u32, what: &str) -> Outcome {
+/// Sends `bytes` (a flood), then expects GOAWAY with one of `codes` (any error code if `codes` is
+/// empty) and the close. A send that fails halfway means the server closed already, which still
+/// has to show its GOAWAY.
+async fn flood(ctx: &Ctx, bytes: &[u8], codes: &[u32], what: &str) -> Outcome {
   let mut h2 = match open(ctx, &ctx.opts, None).await {
     Ok(elem) => elem,
     Err(outcome) => return outcome,
@@ -104,8 +103,11 @@ async fn flood(ctx: &Ctx, bytes: &[u8], code: u32, what: &str) -> Outcome {
     Err(err) => return from_err(err, Some(&h2.conn)),
   };
   match got.go_away {
-    Some((got_code, _)) if got_code == code || code == 0 && got_code != 0 => {}
-    other => return h2_fail(format!("{what}: GOAWAY {other:?}, expected code {code}"), &h2),
+    Some((got_code, _)) if codes.contains(&got_code) || codes.is_empty() && got_code != 0 => {}
+    other => {
+      let want = if codes.is_empty() { "any error".to_owned() } else { format!("{codes:?}") };
+      return h2_fail(format!("{what}: GOAWAY {other:?}, expected code {want}"), &h2);
+    }
   }
   match h2.conn.expect_eof(Instant::now() + slack(CLOSE)).await {
     Ok(()) => Outcome::Pass,
@@ -115,24 +117,25 @@ async fn flood(ctx: &Ctx, bytes: &[u8], code: u32, what: &str) -> Outcome {
 
 /// Streams opened and reset at once, past the server's reset budget (CVE-2023-44487).
 pub(super) async fn rapid_reset(ctx: &Ctx, _: &mut Rng) -> Outcome {
+  let r = &ctx.routes;
   let mut bytes = Vec::new();
   for idx in 0..1000u32 {
     let id = 2 * idx + 1;
     // A request with a body to come keeps the stream open until the reset.
-    bytes.extend(request(id, "POST", "/echo", &[], false));
+    bytes.extend(request(&ctx.host, id, "POST", &r.echo_path, &[], false));
     bytes.extend(frame(RST_STREAM, 0, id, &8u32.to_be_bytes()));
   }
-  flood(ctx, &bytes, CALM, "rapid reset").await
+  flood(ctx, &bytes, &ctx.expect.h2_calm, "rapid reset").await
 }
 
 /// A header block that never ends: CONTINUATION after CONTINUATION.
 pub(super) async fn continuation_flood(ctx: &Ctx, _: &mut Rng) -> Outcome {
-  let block = header_block("GET", "/baseline2", &[("x-pad", &"p".repeat(64))]);
+  let block = header_block(&ctx.host, "GET", &ctx.routes.ok_path, &[("x-pad", &"p".repeat(64))]);
   let mut bytes = frame(HEADERS, END_STREAM, 1, &block[..8]);
   for _ in 0..1000 {
     bytes.extend(frame(CONTINUATION, 0, 1, &[0x40, 1, b'x', 1, b'y']));
   }
-  flood(ctx, &bytes, 0, "CONTINUATION flood").await
+  flood(ctx, &bytes, &[], "CONTINUATION flood").await
 }
 
 /// SETTINGS frames, each owed an acknowledgement, past the control-frame budget.
@@ -141,7 +144,7 @@ pub(super) async fn settings_flood(ctx: &Ctx, _: &mut Rng) -> Outcome {
   for _ in 0..3000 {
     bytes.extend(frame(SETTINGS, 0, 0, &[]));
   }
-  flood(ctx, &bytes, CALM, "SETTINGS flood").await
+  flood(ctx, &bytes, &ctx.expect.h2_calm, "SETTINGS flood").await
 }
 
 /// PINGs past the control-frame budget.
@@ -150,18 +153,20 @@ pub(super) async fn ping_flood(ctx: &Ctx, rng: &mut Rng) -> Outcome {
   for _ in 0..3000 {
     bytes.extend(frame(PING, 0, 0, &rng.random::<[u8; 8]>()));
   }
-  flood(ctx, &bytes, CALM, "PING flood").await
+  flood(ctx, &bytes, &ctx.expect.h2_calm, "PING flood").await
 }
 
-/// Reads a 10 MiB response 1 KiB a second for 8 s, through a 4 KiB receive buffer: what arrives
-/// is right, and the server's memory (the monitor) and other clients (the probes) don't suffer.
+/// Reads the large response 1 KiB a second for 8 s, through a 4 KiB receive buffer: what arrives
+/// is right (byte `i` is `i % 251` when `Routes::big_pattern` is set), and the server's memory (the
+/// monitor) and other clients (the probes) don't suffer.
 pub(super) async fn slow_reader(ctx: &Ctx, _: &mut Rng) -> Outcome {
   let opts = ConnOpts { rcvbuf: Some(4096), ..ctx.opts.clone() };
   let mut h2 = match open(ctx, &opts, None).await {
     Ok(elem) => elem,
     Err(outcome) => return outcome,
   };
-  if let Err(err) = h2.conn.send(&request(1, "GET", "/static/big.bin", &[], true)).await {
+  let big = request(&ctx.host, 1, "GET", &ctx.routes.big_path, &[], true);
+  if let Err(err) = h2.conn.send(&big).await {
     return from_err(err, Some(&h2.conn));
   }
   let mut body = 0usize;
@@ -181,7 +186,8 @@ pub(super) async fn slow_reader(ctx: &Ctx, _: &mut Rng) -> Outcome {
       if frame.ty != DATA {
         continue;
       }
-      if frame.payload.iter().enumerate().any(|(idx, byte)| *byte != static_byte(body + idx)) {
+      let pattern = ctx.routes.big_pattern;
+      if pattern && frame.payload.iter().enumerate().any(|(idx, b)| *b != static_byte(body + idx)) {
         return h2_fail(format!("wrong bytes at {body}"), &h2);
       }
       body += frame.payload.len();
@@ -191,7 +197,7 @@ pub(super) async fn slow_reader(ctx: &Ctx, _: &mut Rng) -> Outcome {
   Outcome::Pass
 }
 
-/// Asks for 20 copies of a 10 MiB file through a 4 KiB receive buffer and never reads: once its
+/// Asks for 20 copies of the large file through a 4 KiB receive buffer and never reads: once its
 /// sends stall, the server must close within its idle timeout, long before sending them all.
 pub(super) async fn never_read(ctx: &Ctx, _: &mut Rng) -> Outcome {
   let opts = ConnOpts { rcvbuf: Some(4096), ..ctx.opts.clone() };
@@ -201,7 +207,7 @@ pub(super) async fn never_read(ctx: &Ctx, _: &mut Rng) -> Outcome {
   };
   let mut bytes = Vec::new();
   for idx in 0..20u32 {
-    bytes.extend(request(2 * idx + 1, "GET", "/static/big.bin", &[], true));
+    bytes.extend(request(&ctx.host, 2 * idx + 1, "GET", &ctx.routes.big_path, &[], true));
   }
   if let Err(err) = h2.conn.send(&bytes).await {
     return from_err(err, Some(&h2.conn));
@@ -216,8 +222,8 @@ pub(super) async fn never_read(ctx: &Ctx, _: &mut Rng) -> Outcome {
         return h2_fail(format!("still sending after the idle timeout: {read} bytes read"), &h2);
       }
       Ok(0) => {
-        // EOF (or a reset): what was read must be far short of the 200 MiB asked for.
-        return if read < 20 * BIG / 2 {
+        // EOF (or a reset): what was read must be far short of the 20 copies asked for.
+        return if read < 20 * ctx.routes.big_len / 2 {
           Outcome::Pass
         } else {
           h2_fail(format!("{read} bytes read: the server never stalled"), &h2)
@@ -239,7 +245,8 @@ pub(super) async fn window_starved(ctx: &Ctx, _: &mut Rng) -> Outcome {
     Ok(elem) => elem,
     Err(outcome) => return outcome,
   };
-  if let Err(err) = h2.conn.send(&request(1, "GET", "/static/big.bin", &[], true)).await {
+  let big = request(&ctx.host, 1, "GET", &ctx.routes.big_path, &[], true);
+  if let Err(err) = h2.conn.send(&big).await {
     return from_err(err, Some(&h2.conn));
   }
   let deadline = Instant::now() + slack(ctx.limits.idle) + slack(CLOSE);
@@ -272,7 +279,7 @@ pub(super) async fn half_open(ctx: &Ctx, _: &mut Rng) -> Outcome {
 }
 
 /// After a refused request, the connection still serves, unless the server sent GOAWAY.
-async fn still_serves(mut h2: H2, refused: u32, next: u32) -> Outcome {
+async fn still_serves(ctx: &Ctx, mut h2: H2, refused: u32, next: u32) -> Outcome {
   let got = match h2.collect(&[refused], Instant::now() + RESPONSE).await {
     Ok(elem) => elem,
     Err(err) => return from_err(err, Some(&h2.conn)),
@@ -287,12 +294,16 @@ async fn still_serves(mut h2: H2, refused: u32, next: u32) -> Outcome {
   if response.reset.is_none() && response.status.is_none() {
     return h2_fail(format!("stream {refused}: no answer"), &h2);
   }
-  if let Err(err) = h2.conn.send(&request(next, "GET", "/baseline2", &[], true)).await {
+  let ok = request(&ctx.host, next, "GET", &ctx.routes.ok_path, &[], true);
+  if let Err(err) = h2.conn.send(&ok).await {
     return from_err(err, Some(&h2.conn));
   }
   match h2.collect(&[next], Instant::now() + RESPONSE).await {
     Ok(got)
-      if got.responses.get(&next).is_some_and(|el| el.status == Some(200) && el.body == b"ok") =>
+      if got
+        .responses
+        .get(&next)
+        .is_some_and(|el| el.status == Some(200) && el.body == ctx.routes.ok_body.as_bytes()) =>
     {
       Outcome::Pass
     }
@@ -308,7 +319,8 @@ pub(super) async fn oversized_headers(ctx: &Ctx, _: &mut Rng) -> Outcome {
     Ok(elem) => elem,
     Err(outcome) => return outcome,
   };
-  let block = header_block("GET", "/baseline2", &[("x-big", &"b".repeat(100 << 10))]);
+  let pad = "b".repeat(100 << 10);
+  let block = header_block(&ctx.host, "GET", &ctx.routes.ok_path, &[("x-big", &pad)]);
   let chunks: Vec<&[u8]> = block.chunks(16_384).collect();
   let mut bytes = Vec::new();
   for (idx, chunk) in chunks.iter().enumerate() {
@@ -319,7 +331,7 @@ pub(super) async fn oversized_headers(ctx: &Ctx, _: &mut Rng) -> Outcome {
   if let Err(err @ ConnError::Harness(_)) = h2.conn.send(&bytes).await {
     return from_err(err, Some(&h2.conn));
   }
-  still_serves(h2, 1, 3).await
+  still_serves(ctx, h2, 1, 3).await
 }
 
 /// A body announced at 100 MB, past the server's limit: refused (reset, 413 or GOAWAY) after at
@@ -329,17 +341,17 @@ pub(super) async fn oversized_body(ctx: &Ctx, _: &mut Rng) -> Outcome {
     Ok(elem) => elem,
     Err(outcome) => return outcome,
   };
-  let mut bytes = request(1, "POST", "/echo", &[("content-length", "100000000")], false);
+  let length = [("content-length", "100000000")];
+  let mut bytes = request(&ctx.host, 1, "POST", &ctx.routes.echo_path, &length, false);
   bytes.extend(frame(DATA, 0, 1, &[b'x'; 16_384]));
   if let Err(err @ ConnError::Harness(_)) = h2.conn.send(&bytes).await {
     return from_err(err, Some(&h2.conn));
   }
-  still_serves(h2, 1, 3).await
+  still_serves(ctx, h2, 1, 3).await
 }
 
-/// Fills the server's caches before the baseline is measured: `/static/big.bin` and
-/// `/static/small.txt` over enough connections to reach every runtime thread. Errors are left to
-/// the scenarios.
+/// Fills the server's caches before the baseline is measured: the large file and the ok route over
+/// enough connections to reach every runtime thread. Errors are left to the scenarios.
 pub async fn warm_h2_caches(ctx: &Ctx) {
   let mut fetches = tokio::task::JoinSet::new();
   for _ in 0..96 {
@@ -348,8 +360,8 @@ pub async fn warm_h2_caches(ctx: &Ctx) {
       let Ok(mut h2) = open(&ctx, &ctx.opts, None).await else {
         return;
       };
-      let mut bytes = request(1, "GET", "/static/big.bin", &[], true);
-      bytes.extend(request(3, "GET", "/static/small.txt", &[], true));
+      let mut bytes = request(&ctx.host, 1, "GET", &ctx.routes.big_path, &[], true);
+      bytes.extend(request(&ctx.host, 3, "GET", &ctx.routes.ok_path, &[], true));
       if h2.conn.send(&bytes).await.is_ok() {
         let _got = h2.collect(&[1, 3], Instant::now() + Duration::from_secs(30)).await;
       }

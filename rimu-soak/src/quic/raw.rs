@@ -1,7 +1,7 @@
-//! A minimal raw QUIC packet sender, built on codecs of the harness's own (ruling T23-b): QUIC
+//! A minimal raw QUIC packet sender, built on codecs of the harness's own: QUIC
 //! varints, long and short headers, the Initial secrets of RFC 9001 section 5.2, AEAD (AES-128-GCM)
 //! and header protection (AES-128-ECB) for the Initial level, and the few frame encoders the abuse
-//! scenarios need. It shares no code with rimu-ws, so a bug the two had in common could not hide.
+//! scenarios need. It shares no code with the servers it tests, so a bug the two had in common could not hide.
 //!
 //! It reaches the Initial level only: 1-RTT packets need the handshake secrets, which only a full
 //! TLS 1.3 exchange yields, so the scenarios that must speak 1-RTT frames are driven with `quinn`
@@ -118,7 +118,7 @@ pub fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
 
 /// Removes the protection of the first Initial packet of `datagram` (a server reply) with the
 /// server-side Initial keys for `dcid` (the client's original DCID), and returns its decrypted
-/// frame bytes. Used to read a handshake-level CONNECTION_CLOSE (ruling T23-j #2).
+/// frame bytes. Used to read a handshake-level CONNECTION_CLOSE.
 pub fn open_server_initial(dcid: &[u8], datagram: &[u8]) -> Option<Vec<u8>> {
   let keys = InitialKeys::server(dcid);
   let first = *datagram.first()?;
@@ -355,11 +355,11 @@ fn put_prefixed_int(out: &mut Vec<u8>, n: u32, prefix: u8, value: u64) {
   }
 }
 
-/// A HEADERS frame for `GET /baseline2` whose QPACK field section is oversized by a literal header
+/// A HEADERS frame for `GET path` on `authority` whose QPACK field section is oversized by a literal header
 /// with a `value_len`-byte value (plus valid pseudo-headers), to trip the server's advertised
 /// `SETTINGS_MAX_FIELD_SECTION_SIZE` and draw a 431. The field section uses the static table only
 /// (required insert count 0), so the server needs no QPACK dynamic state to decode it.
-pub fn h3_oversized_headers_frame(value_len: usize) -> Vec<u8> {
+pub fn h3_oversized_headers_frame(authority: &str, path: &str, value_len: usize) -> Vec<u8> {
   let mut fields = Vec::new();
   // QPACK encoded field section prefix: required insert count 0, delta base 0.
   fields.extend_from_slice(&[0x00, 0x00]);
@@ -367,14 +367,14 @@ pub fn h3_oversized_headers_frame(value_len: usize) -> Vec<u8> {
   fields.push(0xc0 | 17);
   // :scheme https — static index 23.
   fields.push(0xc0 | 23);
-  // :authority localhost — literal field line with name reference to static index 0 (01 N=0 T=1).
+  // :authority — literal field line with name reference to static index 0 (01 N=0 T=1).
   fields.push(0x50);
-  put_prefixed_int(&mut fields, 7, 0x00, b"localhost".len() as u64);
-  fields.extend_from_slice(b"localhost");
-  // :path /baseline2 — literal with name reference to static index 1.
+  put_prefixed_int(&mut fields, 7, 0x00, authority.len() as u64);
+  fields.extend_from_slice(authority.as_bytes());
+  // :path — literal with name reference to static index 1.
   fields.push(0x51);
-  put_prefixed_int(&mut fields, 7, 0x00, b"/baseline2".len() as u64);
-  fields.extend_from_slice(b"/baseline2");
+  put_prefixed_int(&mut fields, 7, 0x00, path.len() as u64);
+  fields.extend_from_slice(path.as_bytes());
   // One oversized header, literal name + literal value (001 N=0 H=0, 3-bit name length), name "x".
   fields.push(0x20 | 1);
   fields.push(b'x');

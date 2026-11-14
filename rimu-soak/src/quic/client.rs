@@ -6,8 +6,8 @@ use bytes::Buf as _;
 use quinn::{ClientConfig, Connection, ConnectionError, Endpoint, TransportConfig, VarInt};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-/// A certificate verifier that accepts anything: the soak runs on loopback against a self-signed
-/// certificate, and the point is to test the server's QUIC, not its certificate.
+/// A certificate verifier that accepts anything: soak targets usually run self-signed certificates,
+/// and the point is to test the server's QUIC, not its certificate.
 #[derive(Debug)]
 struct TrustAny(Arc<rustls::crypto::CryptoProvider>);
 
@@ -164,26 +164,33 @@ pub struct H3Response {
 /// request would open a second control stream and the server would close the connection with
 /// `H3_CLOSED_CRITICAL_STREAM`.
 pub struct H3Session {
+  authority: String,
   send: h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
   driver: tokio::task::JoinHandle<()>,
 }
 
+impl std::fmt::Debug for H3Session {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("H3Session").field("authority", &self.authority).finish_non_exhaustive()
+  }
+}
+
 impl H3Session {
-  /// Sets up the HTTP/3 connection (control stream, QPACK streams) over `conn`.
-  pub async fn open(conn: Connection) -> Result<H3Session, String> {
+  /// Sets up the HTTP/3 connection (control stream, QPACK streams) over `conn`; requests carry
+  /// `authority`.
+  pub async fn open(conn: Connection, authority: &str) -> Result<H3Session, String> {
     let h3_conn = h3_quinn::Connection::new(conn);
     let (mut driver, send) =
       h3::client::new(h3_conn).await.map_err(|err| format!("h3 new: {err}"))?;
     let handle = tokio::spawn(async move {
       let _ = driver.wait_idle().await;
     });
-    Ok(H3Session { send, driver: handle })
+    Ok(H3Session { authority: authority.to_owned(), send, driver: handle })
   }
 
-  /// One HTTP/3 `GET` of `path`, reusing the session. The authority is `localhost`, matching the
-  /// server's certificate.
+  /// One HTTP/3 `GET` of `path`, reusing the session.
   pub async fn get(&mut self, path: &str) -> Result<H3Response, String> {
-    let uri = format!("https://localhost{path}");
+    let uri = format!("https://{}{path}", self.authority);
     let req = http::Request::builder()
       .method("GET")
       .uri(&uri)
@@ -211,11 +218,36 @@ impl Drop for H3Session {
   }
 }
 
-/// One HTTP/3 `GET` over a fresh session on `conn` (for a single request).
-pub async fn h3_get(conn: Connection, path: &str) -> Result<H3Response, String> {
-  let mut session = H3Session::open(conn).await?;
+/// One HTTP/3 `GET` of `path` with `authority` over a fresh session on `conn` (for a single
+/// request).
+pub async fn h3_get(conn: Connection, authority: &str, path: &str) -> Result<H3Response, String> {
+  let mut session = H3Session::open(conn, authority).await?;
   session.get(path).await
 }
 
 /// A convenience error code: HTTP/3 `H3_NO_ERROR`, used to close a stream or connection cleanly.
 pub const H3_NO_ERROR: VarInt = VarInt::from_u32(0x0100);
+
+/// The address a client socket towards `target` binds: `127.0.0.<octet>` (or `::1`) when the
+/// target is on loopback, so the raw scenarios can come from several loopback addresses, and the
+/// unspecified address of the target's family otherwise.
+pub fn local_bind(target: SocketAddr, octet: u8) -> SocketAddr {
+  use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+  let ip: IpAddr = match target.ip() {
+    IpAddr::V4(ip) if ip.is_loopback() => Ipv4Addr::new(127, 0, 0, octet.max(1)).into(),
+    IpAddr::V6(ip) if ip.is_loopback() => Ipv6Addr::LOCALHOST.into(),
+    IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+    IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
+  };
+  SocketAddr::new(ip, 0)
+}
+
+/// The unspecified address of `target`'s family, port 0: where an ordinary client endpoint binds.
+pub fn any_bind(target: SocketAddr) -> SocketAddr {
+  use std::net::{Ipv4Addr, Ipv6Addr};
+  if target.is_ipv6() {
+    (Ipv6Addr::UNSPECIFIED, 0).into()
+  } else {
+    (Ipv4Addr::UNSPECIFIED, 0).into()
+  }
+}

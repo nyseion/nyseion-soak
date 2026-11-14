@@ -1,4 +1,4 @@
-//! A `quinn::AsyncUdpSocket` wrapper (ruling T23-j #3) around several inner sockets, so one quinn
+//! A `quinn::AsyncUdpSocket` wrapper around several inner sockets, so one quinn
 //! connection's datagrams can be spread across source addresses per datagram (the migration
 //! flapper) and the client's transmit can be black-holed after the request (the never-ACK slow
 //! reader). It counts bytes in and out per inner socket, so the flapper can assert the server sends
@@ -74,7 +74,12 @@ impl FlapSocket {
     self.bytes_in.get(i).map_or(0, |el| el.load(Ordering::Relaxed))
   }
 
-  /// Number of inner sockets.
+  /// Whether there are no inner sockets.
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+
+  /// The number of inner sockets.
   pub fn len(&self) -> usize {
     self.inners.len()
   }

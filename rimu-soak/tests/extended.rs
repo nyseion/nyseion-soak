@@ -9,7 +9,7 @@ use rimu_soak::{
   cycle::{CycleConfig, Extended, RecordMode, run, trend_violation},
   monitor::Violation,
   runner::RunConfig,
-  scenario::{Proto, Ctx, Limits, parse_weights, profile},
+  scenario::{Ctx, Limits, Proto, parse_weights, profile},
 };
 use std::{net::SocketAddr, time::Duration};
 use support::{Faults, spawn_fake};
@@ -26,6 +26,8 @@ fn config(addr: SocketAddr, pid: u32) -> CycleConfig {
     limits: Limits::default(),
     opts: ConnOpts::default(),
     proto: Proto::Ws,
+    routes: Default::default(),
+    expect: Default::default(),
   };
   CycleConfig {
     run: RunConfig {
@@ -72,6 +74,7 @@ async fn failures_only_keeps_no_passing_records() {
   cfg.ext.records = RecordMode::Failures;
   let (summary, out) = run_with(cfg).await;
   let _ = child.kill();
+  let _ = child.wait();
   assert!(summary.records > 0, "{summary:?}");
   assert!(lines(&out, "record").is_empty());
 
@@ -81,6 +84,7 @@ async fn failures_only_keeps_no_passing_records() {
   cfg.ext.records = RecordMode::Failures;
   let (summary, out) = run_with(cfg).await;
   let _ = child.kill();
+  let _ = child.wait();
   let records = lines(&out, "record");
   assert!(!records.is_empty(), "{summary:?}");
   assert!(records.iter().all(|el| el["outcome"] == "fail"));
@@ -96,6 +100,7 @@ async fn heartbeats_and_whole_run_latency() {
   cfg.ext.heartbeat = Some(Duration::from_secs(1));
   let (summary, out) = run_with(cfg).await;
   let _ = child.kill();
+  let _ = child.wait();
   let beats = lines(&out, "heartbeat");
   assert!(beats.len() >= 2, "{} heartbeats", beats.len());
   let last = beats.last().unwrap();
@@ -121,6 +126,7 @@ async fn profiles_rotate_by_cycle() {
   ];
   let (summary, out) = run_with(cfg).await;
   let _ = child.kill();
+  let _ = child.wait();
   assert_eq!(summary.fails, 0, "{summary:?}");
   let profiles: Vec<_> =
     lines(&out, "warmup").iter().map(|el| el["profile"].as_str().unwrap().to_owned()).collect();
@@ -177,6 +183,7 @@ async fn max_time_ends_the_run_early() {
   let begin = std::time::Instant::now();
   let (summary, _) = run_with(cfg).await;
   let _ = child.kill();
+  let _ = child.wait();
   assert!(begin.elapsed() < Duration::from_secs(8), "{:?}", begin.elapsed());
   assert!(summary.cycles <= 2, "{summary:?}");
   assert_eq!(summary.stopped.as_deref(), Some("max time"), "{summary:?}");
@@ -194,6 +201,7 @@ async fn stop_on_first_failure() {
   let begin = std::time::Instant::now();
   let (summary, _) = run_with(cfg).await;
   let _ = child.kill();
+  let _ = child.wait();
   assert!(summary.fails > 0, "{summary:?}");
   assert_eq!(summary.cycles, 1, "{summary:?}");
   assert!(begin.elapsed() < Duration::from_secs(5), "{:?}", begin.elapsed());
@@ -227,6 +235,7 @@ async fn burst_phase_runs_after_each_cycle() {
   cfg.ext.burst = Some(100);
   let (summary, out) = run_with(cfg).await;
   let _ = child.kill();
+  let _ = child.wait();
   assert!(summary.violations.is_empty(), "{summary:?}");
   assert_eq!(lines(&out, "burst").len(), 1);
 }

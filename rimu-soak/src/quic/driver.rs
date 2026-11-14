@@ -1,14 +1,14 @@
-//! The QUIC/HTTP/3 soak: a well-behaved steady client (64 connections × 64 streams) on the
-//! four-worker server, a small steady client (4 × 4) on the one-worker server, both running for the
-//! whole ~10-minute run (rulings T23-a/T23-k), beside abusive clients run in sequence. Both servers
-//! are watched once a second. Each abuser is bounded by one limit of `rimu-ws` (spec section 5.12);
-//! its pass rule is that the server's RSS stays within 10 % of the plateau the steady client
-//! settles at (strict, ruling T23-i), the steady client never stalls, and the abuser is closed with
-//! the named error or rate-limited (ruling T23-c).
+//! The QUIC/HTTP/3 soak: a well-behaved steady client (by default 64 connections × 64 streams) on
+//! the main server and a small one (4 × 4) on an optional one-worker server, both running for the
+//! whole run, beside abusive clients run in sequence. Both servers are watched once a second. Each
+//! abuser is bounded by one server limit ([`H3Policy`]); the run passes when the server's RSS stays
+//! within 10 % of the plateau the steady client settles at during the warmup, the steady clients
+//! never stall, and every abuser is closed with the error it expected or rate-limited.
 
 use crate::{
   monitor::{Monitor, Sample},
   quic::{client, scenario},
+  scenario::Routes,
 };
 use std::{
   net::SocketAddr,
@@ -19,6 +19,73 @@ use std::{
   time::Duration,
 };
 use tokio::time::Instant;
+
+/// The server limits and routes the HTTP/3 scenarios judge the server by. The defaults are rimu-ws's
+/// (its HttpArena entry), so a run against another server sets what differs, and leaves out (see
+/// [`H3Policy::scenarios`]) the scenarios that test a limit the server does not have.
+#[derive(Clone, Debug)]
+pub struct H3Policy {
+  /// SNI and `:authority`. The certificate is not checked.
+  pub server_name: String,
+  /// The ok route (`GET` answers 200 with its body) and the large file. The echo route is unused.
+  pub routes: Routes,
+  /// The application close code for a peer over a rate budget (stream resets, PINGs,
+  /// PATH_CHALLENGEs, NEW_CONNECTION_IDs, QPACK encoder backlog): RFC 9114's H3_EXCESSIVE_LOAD,
+  /// 0x0107, by default.
+  pub excessive_load: u64,
+  /// The bidirectional streams the server allows a client at once (`initial_max_streams_bidi`).
+  pub max_bidi_streams: u32,
+  /// Stateless resets (or any replies) the server may send per second to unknown connection IDs.
+  pub stateless_reset_per_sec: u32,
+  /// The server's idle timeout. `window_starved` expects its close between 2/3 and 2 times this.
+  pub idle_timeout: Duration,
+  /// The per-stream receive window the server grants; `onertt_stream_past_window` sends at twice
+  /// it.
+  pub stream_window: u64,
+  /// Connections one worker accepts; `idle_cap` fills them all on the one-worker server.
+  pub conns_per_worker: u32,
+  /// Whether `initial_flood` must draw a Retry. RFC 9000 makes address validation optional;
+  /// without it the scenario still requires that a well-behaved client connects during the flood.
+  pub expect_retry: bool,
+  /// A route answering the server's live heap bytes as a decimal number, for `idle_cap`'s
+  /// per-connection figure.
+  pub mem_path: Option<String>,
+  /// A route answering the server's own connection report as text, for `idle_cap`'s detail.
+  pub stats_path: Option<String>,
+  /// The scenarios to run, by name ([`scenario::ALL`]); `None` runs them all.
+  pub scenarios: Option<Vec<String>>,
+}
+
+impl Default for H3Policy {
+  fn default() -> Self {
+    Self {
+      server_name: "localhost".into(),
+      routes: Routes::default(),
+      excessive_load: 0x0107,
+      max_bidi_streams: 256,
+      stateless_reset_per_sec: 100,
+      idle_timeout: Duration::from_secs(30),
+      stream_window: 1 << 20,
+      conns_per_worker: 4096,
+      expect_retry: true,
+      mem_path: None,
+      stats_path: None,
+      scenarios: None,
+    }
+  }
+}
+
+impl H3Policy {
+  /// Whether scenario `name` is selected.
+  pub fn wants(&self, name: &str) -> bool {
+    self.scenarios.as_ref().is_none_or(|el| el.iter().any(|el| el == name))
+  }
+
+  /// The URI of the large file.
+  pub fn big_uri(&self) -> String {
+    format!("https://{}{}", self.server_name, self.routes.big_path)
+  }
+}
 
 /// What the soak runs against and for how long.
 #[derive(Clone, Debug)]
@@ -31,9 +98,9 @@ pub struct H3Config {
   pub warmup: Duration,
   pub conns: u32,
   pub streams: u32,
-  pub out: std::path::PathBuf,
   pub main_workers: u32,
   pub memlock_kib: Option<u64>,
+  pub policy: H3Policy,
 }
 
 /// One JSONL line.
@@ -60,15 +127,16 @@ pub struct Steady {
 /// well-behaved client.
 const STALL: Duration = Duration::from_secs(2);
 
-/// One `GET /baseline2`, bounded by [`STALL`]: `Some(true)` = 200/`ok`, `Some(false)` = a bad
-/// answer, `None` = timed out (a stall).
+/// One `GET` of the ok route, bounded by [`STALL`]: `Some(true)` = 200 and the ok body,
+/// `Some(false)` = a bad answer, `None` = timed out (a stall).
 async fn one_request(
   sr: &mut h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+  p: &H3Policy,
 ) -> Option<bool> {
   use bytes::Buf as _;
   let fut = async {
-    let req =
-      http::Request::builder().method("GET").uri("https://localhost/baseline2").body(()).ok()?;
+    let uri = format!("https://{}{}", p.server_name, p.routes.ok_path);
+    let req = http::Request::builder().method("GET").uri(uri).body(()).ok()?;
     let mut stream = sr.send_request(req).await.ok()?;
     stream.finish().await.ok()?;
     let resp = stream.recv_response().await.ok()?;
@@ -80,7 +148,7 @@ async fn one_request(
         chunk.advance(n);
       }
     }
-    Some(resp.status().as_u16() == 200 && body == b"ok")
+    Some(resp.status().as_u16() == 200 && body == p.routes.ok_body.as_bytes())
   };
   match tokio::time::timeout(STALL, fut).await {
     Ok(Some(ok)) => Some(ok),
@@ -92,6 +160,7 @@ async fn one_request(
 /// Runs a steady client until `stop`: `conns` connections, each driving `streams` concurrent
 /// request loops over a shared (cloned) `SendRequest`, each request bounded by [`STALL`].
 async fn steady_client(
+  p: Arc<H3Policy>,
   addr: SocketAddr,
   conns: u32,
   streams: u32,
@@ -102,15 +171,14 @@ async fn steady_client(
   let cfg = client::client_config(Some(Duration::from_secs(5)), idle);
   let mut tasks = Vec::new();
   for _ in 0..conns {
-    let (cfg, stop, counters) = (cfg.clone(), stop.clone(), counters.clone());
+    let (cfg, stop, counters, p) = (cfg.clone(), stop.clone(), counters.clone(), p.clone());
     tasks.push(tokio::spawn(async move {
-      let bind: SocketAddr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }.parse().unwrap();
-      let Ok(ep) = client::endpoint(bind, cfg) else {
+      let Ok(ep) = client::endpoint(client::any_bind(addr), cfg) else {
         counters.bad.fetch_add(1, Ordering::Relaxed);
         return;
       };
       while !stop.load(Ordering::Relaxed) {
-        let Ok(conn) = client::connect(&ep, addr, "localhost").await else {
+        let Ok(conn) = client::connect(&ep, addr, &p.server_name).await else {
           counters.bad.fetch_add(1, Ordering::Relaxed);
           if !stop.load(Ordering::Relaxed) {
             counters.stalls.fetch_add(1, Ordering::Relaxed);
@@ -129,11 +197,12 @@ async fn steady_client(
         });
         let mut stream_tasks = Vec::new();
         for _ in 0..streams {
-          let (mut sr, stop, counters) = (send_request.clone(), stop.clone(), counters.clone());
+          let (mut sr, stop, counters, p) =
+            (send_request.clone(), stop.clone(), counters.clone(), p.clone());
           stream_tasks.push(tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
               let begin = Instant::now();
-              let got = one_request(&mut sr).await;
+              let got = one_request(&mut sr, &p).await;
               counters.max_rtt_us.fetch_max(begin.elapsed().as_micros() as u64, Ordering::Relaxed);
               match got {
                 Some(true) => {
@@ -173,20 +242,19 @@ async fn steady_client(
   }
 }
 
-/// Primes the per-thread static cache by fetching `/static/big.bin` (10 MiB) over `fetches`
-/// connections, so the warm-up plateau includes the cache the abuser routes touch (ruling T23-i).
-/// Enough connections that CID steering spreads them over all workers.
-async fn prime_cache(addr: SocketAddr, fetches: u32, idle: Duration) {
+/// Primes the server's caches by fetching the large file over `fetches` connections, so the
+/// warm-up plateau includes the cache the abuser routes touch. Enough connections that connection
+/// ID steering spreads them over all workers.
+async fn prime_cache(p: Arc<H3Policy>, addr: SocketAddr, fetches: u32, idle: Duration) {
   let cfg = client::client_config(None, idle);
-  let bind: SocketAddr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" }.parse().unwrap();
-  let Ok(ep) = client::endpoint(bind, cfg) else { return };
+  let Ok(ep) = client::endpoint(client::any_bind(addr), cfg) else { return };
   let mut tasks = Vec::new();
   for _ in 0..fetches {
-    let ep = ep.clone();
+    let (ep, p) = (ep.clone(), p.clone());
     tasks.push(tokio::spawn(async move {
-      if let Ok(conn) = client::connect(&ep, addr, "localhost").await {
-        if let Ok(mut session) = client::H3Session::open(conn.clone()).await {
-          let _ = session.get("/static/big.bin").await;
+      if let Ok(conn) = client::connect(&ep, addr, &p.server_name).await {
+        if let Ok(mut session) = client::H3Session::open(conn.clone(), &p.server_name).await {
+          let _ = session.get(&p.routes.big_path).await;
         }
         conn.close(client::H3_NO_ERROR, b"");
       }
@@ -216,21 +284,24 @@ fn plateau_kib(samples: &[Sample]) -> u64 {
   samples.iter().map(|el| el.rss_kib).max().unwrap_or(0)
 }
 
-/// Runs the whole soak and writes the JSONL, returning the number of failures.
-pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
+/// Runs the whole soak, writes each result to `out` as a JSON line, and returns them all.
+pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> H3Report {
   let idle_to = Duration::from_secs(30);
   let run_begin = Instant::now();
   let deadline = run_begin + cfg.duration;
 
   // Prime the static cache on both servers first, so the plateau already holds it.
-  prime_cache(cfg.main_addr, 32, idle_to).await; // 32 covers 4 workers with P(miss)≈0.4% (N12)
+  let policy = Arc::new(cfg.policy.clone());
+  // 32 connections reach all of 4 workers but for a 0.4 % chance.
+  prime_cache(policy.clone(), cfg.main_addr, 32, idle_to).await;
   if let Some(idle_addr) = cfg.idle_addr {
-    prime_cache(idle_addr, 4, idle_to).await;
+    prime_cache(policy.clone(), idle_addr, 4, idle_to).await;
   }
 
   let main_stop = Arc::new(AtomicBool::new(false));
   let main_counters = Arc::new(Steady::default());
   let main_steady = tokio::spawn(steady_client(
+    policy.clone(),
     cfg.main_addr,
     cfg.conns,
     cfg.streams,
@@ -241,7 +312,8 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
   let idle_stop = Arc::new(AtomicBool::new(false));
   let idle_counters = Arc::new(Steady::default());
   let idle_steady = cfg.idle_addr.map(|idle_addr| {
-    tokio::spawn(steady_client(idle_addr, 4, 4, idle_to, idle_stop.clone(), idle_counters.clone()))
+    let (stop, counters) = (idle_stop.clone(), idle_counters.clone());
+    tokio::spawn(steady_client(policy.clone(), idle_addr, 4, 4, idle_to, stop, counters))
   });
 
   // Plateau: warm-up window only.
@@ -257,9 +329,9 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
     None => 0,
   };
 
-  // Whole-run sampling for the peak. The idle sampler is stopped before the idle_4096 phase, so the
+  // Whole-run sampling for the peak. The idle sampler is stopped before the idle_cap phase, so the
   // idle server's RSS gate reflects the steady client plus the raw floods, not the deliberate
-  // 4,096-connection spike (idle_4096 does its own per-connection RSS check, ruling T23-k).
+  // spike of a full worker (idle_cap does its own per-connection RSS check).
   let samp_main_stop = Arc::new(AtomicBool::new(false));
   let samp_idle_stop = Arc::new(AtomicBool::new(false));
   let samp_main =
@@ -281,7 +353,7 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
     rss_peak_kib: None,
   });
 
-  // Abusers (each with its own deadline), while the steady clients run. idle_4096 is handled
+  // Abusers (each with its own deadline), while the steady clients run. idle_cap is handled
   // separately below, after the idle sampler is stopped.
   let results = scenario::run_all(&cfg, deadline).await;
   for r in results {
@@ -294,14 +366,15 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
     });
   }
 
-  // idle_4096 phase: stop the idle steady client and its RSS sampler, then run the cap scenario,
-  // which does its own per-connection RSS check (ruling T23-k).
+  // idle_cap phase: stop the idle steady client and its RSS sampler, then run the cap scenario,
+  // which does its own per-connection RSS check.
   samp_idle_stop.store(true, Ordering::Relaxed);
   let idle_samples = match samp_idle {
     Some(h) => h.await.unwrap_or_default(),
     None => Vec::new(),
   };
-  if let (Some(idle_addr), Some(idle_pid)) = (cfg.idle_addr, cfg.idle_pid) {
+  let idle_cap = cfg.policy.wants("idle_cap");
+  if let (Some(idle_addr), Some(idle_pid), true) = (cfg.idle_addr, cfg.idle_pid, idle_cap) {
     idle_stop.store(true, Ordering::Relaxed);
     if let Some(h) = idle_steady {
       let _ = tokio::time::timeout(Duration::from_secs(10), h).await;
@@ -309,16 +382,16 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
     // Let the idle steady client's connections drain from the one-worker server so the cap is free
     // for the 4,096-connection fill.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    // Its own deadline (N10): a wedged fill fails the scenario instead of hanging the run.
+    // Its own deadline: a wedged fill fails the scenario instead of hanging the run.
     let r = match tokio::time::timeout(
       Duration::from_secs(300),
-      scenario::idle_connections(idle_addr, idle_pid),
+      scenario::idle_connections(&cfg.policy, idle_addr, idle_pid),
     )
     .await
     {
       Ok(r) => r,
       Err(_) => scenario::ScenarioResult {
-        name: "idle_4096".into(),
+        name: "idle_cap".into(),
         pass: false,
         detail: "exceeded its 300 s deadline".into(),
       },
@@ -337,7 +410,7 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
     }
   }
 
-  // Keep the main steady client running until the full duration elapses (ruling T23-a).
+  // Keep the main steady client running until the full duration elapses.
   let remaining = deadline.saturating_duration_since(Instant::now());
   if remaining > Duration::ZERO {
     tokio::time::sleep(remaining).await;
@@ -349,6 +422,7 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
   let main_samples = samp_main.await.unwrap_or_default();
 
   let mut fails = 0u32;
+  let mut results = Vec::new();
   let mut emit = |line: Line, fails: &mut u32| {
     if !line.pass {
       *fails = fails.wrapping_add(1);
@@ -356,6 +430,7 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
     if let Ok(text) = serde_json::to_string(&line) {
       let _ = writeln!(out, "{text}");
     }
+
     eprintln!(
       "{} {} {} — {}",
       if line.pass { "PASS" } else { "FAIL" },
@@ -363,6 +438,7 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
       line.name,
       line.detail
     );
+    results.push(line);
   };
 
   for (label, plateau, samples) in
@@ -425,5 +501,15 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> u32 {
     cfg.main_workers,
     cfg.memlock_kib.map_or("unlimited".into(), |el| format!("{el} KiB"))
   );
-  fails
+  H3Report { pass: fails == 0, fails, wall_s: wall.as_secs_f64(), results }
+}
+
+/// What an HTTP/3 soak found.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct H3Report {
+  pub pass: bool,
+  pub fails: u32,
+  pub wall_s: f64,
+  /// The RSS checks, the steady clients, then every scenario, in that order.
+  pub results: Vec<Line>,
 }

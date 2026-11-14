@@ -9,10 +9,13 @@ use std::{
   time::Duration,
 };
 
+/// Every datagram the echo server got, and where from.
+type Seen = Arc<Mutex<Vec<(SocketAddr, Vec<u8>)>>>;
+
 /// An echo server on 127.0.0.1 that records every datagram and where it came from.
 struct Echo {
   port: u16,
-  seen: Arc<Mutex<Vec<(SocketAddr, Vec<u8>)>>>,
+  seen: Seen,
 }
 
 fn echo_server() -> Echo {
@@ -74,7 +77,7 @@ fn exchange(proxy_port: u16, n: u32, wait: Duration) -> Vec<u32> {
   got
 }
 
-fn numbers(seen: &Mutex<Vec<(SocketAddr, Vec<u8>)>>) -> BTreeSet<u32> {
+fn numbers(seen: &Seen) -> BTreeSet<u32> {
   seen.lock().unwrap().iter().map(|el| u32::from_be_bytes(el.1[..4].try_into().unwrap())).collect()
 }
 

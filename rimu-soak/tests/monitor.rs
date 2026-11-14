@@ -106,7 +106,6 @@ fn large_messages_in_flight_raise_the_rss_limit() {
   );
 }
 
-
 // The HTTP/2 server streaming large responses may hold more per connection than the WebSocket
 // server: the budget per slot follows the server.
 #[test]
@@ -116,5 +115,7 @@ fn per_slot_budget_follows_the_server() {
   let limit_kib = 1000 + 768 * 100 + 65536;
   let mut streak = 0;
   assert!(check_running(&base, &sample(10, limit_kib, 0), 0, &budgets, &mut streak).is_empty());
-  assert!(!check_running(&base, &sample(10, limit_kib + 1, 0), 0, &budgets, &mut streak).is_empty());
+  assert!(
+    !check_running(&base, &sample(10, limit_kib + 1, 0), 0, &budgets, &mut streak).is_empty()
+  );
 }

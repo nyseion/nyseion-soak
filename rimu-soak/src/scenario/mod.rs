@@ -204,7 +204,7 @@ pub struct Limits {
   pub server_sndbuf: Option<u32>,
 }
 
-/// `soak-server-uring`'s defaults.
+/// 2 s, 5 s, 2 s and 1 MiB: rimu-ws's soak server's defaults.
 impl Default for Limits {
   fn default() -> Self {
     Self {
@@ -223,6 +223,51 @@ pub fn slack(limit: Duration) -> Duration {
   limit * 5 / 4 + Duration::from_millis(250)
 }
 
+/// The HTTP/2 routes the scenarios use. The defaults are the HttpArena layout rimu-ws serves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Routes {
+  /// `GET` answers 200 with `ok_body`.
+  pub ok_path: String,
+  pub ok_body: String,
+  /// `POST` answers 200 with the request body.
+  pub echo_path: String,
+  /// `GET` answers 200 with a large body (`big_len` bytes), for the slow and absent readers.
+  pub big_path: String,
+  pub big_len: usize,
+  /// Whether byte `i` of the large body is `i % 251`, which `h2_slow_reader` then checks.
+  pub big_pattern: bool,
+}
+
+impl Default for Routes {
+  fn default() -> Self {
+    Self {
+      ok_path: "/baseline2".into(),
+      ok_body: "ok".into(),
+      echo_path: "/echo".into(),
+      big_path: "/static/big.bin".into(),
+      big_len: 10 << 20,
+      big_pattern: true,
+    }
+  }
+}
+
+/// The codes the oracles accept where the RFCs leave the server a choice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Expect {
+  /// WebSocket close codes for a message over the server's limit (`invalid`'s oversized case,
+  /// `frag_drip` over the limit). RFC 6455 section 7.4.1 names 1009; `huge_len` accepts 1002 too.
+  pub too_big: Vec<u16>,
+  /// HTTP/2 GOAWAY codes for the rapid reset, SETTINGS and PING floods. RFC 9113 section 5.4.1
+  /// lets a server pick; ENHANCE_YOUR_CALM (11) is the usual one. Empty accepts any error code.
+  pub h2_calm: Vec<u32>,
+}
+
+impl Default for Expect {
+  fn default() -> Self {
+    Self { too_big: vec![1009], h2_calm: vec![11] }
+  }
+}
+
 /// Which protocol the server speaks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum Proto {
@@ -237,18 +282,39 @@ pub enum Proto {
 #[derive(Clone, Debug)]
 pub struct Ctx {
   pub addr: SocketAddr,
+  /// The `Host` header (WebSocket) or `:authority` (HTTP/2).
   pub host: String,
+  /// The WebSocket path.
   pub path: String,
   pub limits: Limits,
   pub opts: ConnOpts,
   pub proto: Proto,
+  pub routes: Routes,
+  pub expect: Expect,
+}
+
+impl Ctx {
+  /// A context for `addr` with every other setting at its default: WebSocket on `/`, host
+  /// `localhost`.
+  pub fn new(addr: SocketAddr) -> Ctx {
+    Ctx {
+      addr,
+      host: "localhost".into(),
+      path: "/".into(),
+      limits: Limits::default(),
+      opts: ConnOpts::default(),
+      proto: Proto::Ws,
+      routes: Routes::default(),
+      expect: Expect::default(),
+    }
+  }
 }
 
 /// A connection ready for round trips: an upgraded WebSocket, or HTTP/2 past its opening.
 #[derive(Debug)]
 pub enum Ready {
   Ws(Conn),
-  H2 { h2: H2, next_id: u32 },
+  H2 { h2: H2, next_id: u32, authority: String, echo_path: String },
 }
 
 impl Ready {
@@ -260,12 +326,17 @@ impl Ready {
         conn.upgrade(&ctx.host, &ctx.path, rng).await?;
         Ok(Ready::Ws(conn))
       }
-      Proto::H2 => Ok(Ready::H2 { h2: H2::open(conn, None).await?, next_id: 1 }),
+      Proto::H2 => Ok(Ready::H2 {
+        h2: H2::open(conn, None).await?,
+        next_id: 1,
+        authority: ctx.host.clone(),
+        echo_path: ctx.routes.echo_path.clone(),
+      }),
     }
   }
 
   /// Sends `payload` and checks it comes back by `deadline`: a WebSocket text echo, or the body
-  /// of a `POST /echo`.
+  /// of a `POST` to the echo route.
   pub async fn round_trip(
     &mut self,
     payload: &[u8],
@@ -282,10 +353,10 @@ impl Ready {
             Ok(Next::Frame(echo)) if echo.opcode == 1 && echo.payload == payload
           )
       }
-      Ready::H2 { h2, next_id } => {
+      Ready::H2 { h2, next_id, authority, echo_path } => {
         let id = *next_id;
         *next_id += 2;
-        let mut bytes = request(id, "POST", "/echo", &[], false);
+        let mut bytes = request(authority, id, "POST", echo_path, &[], false);
         bytes.extend(frame(DATA, END_STREAM, id, payload));
         if h2.conn.send(&bytes).await.is_err() {
           return false;

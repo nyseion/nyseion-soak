@@ -1,7 +1,7 @@
-//! QUIC and HTTP/3 soak scenarios (task 23): a well-behaved steady client that runs for the whole
-//! run beside abusive clients, each abuser bounded by one of rimu-ws's QUIC limits (spec
-//! section 5.12). The library abusers are driven with `quinn`/`h3`; the raw ones with [`raw`],
-//! which speaks QUIC through codecs of the harness's own (ruling T23-b).
+//! QUIC and HTTP/3 soak scenarios: a well-behaved steady client that runs for the whole
+//! run beside abusive clients, each abuser bounded by one of the server's QUIC limits
+//! ([`driver::H3Policy`]). The library abusers are driven with `quinn`/`h3`; the raw ones with [`raw`],
+//! which speaks QUIC through codecs of the harness's own.
 
 pub mod client;
 pub mod driver;

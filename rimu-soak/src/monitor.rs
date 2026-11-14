@@ -74,6 +74,43 @@ fn read(path: &str) -> Result<String, MonitorError> {
   })
 }
 
+/// The pid of the one process named `name`: its command name (`/proc/PID/comm`, which the kernel
+/// cuts to 15 bytes) or the file name of its executable (`argv[0]`). Errs when no process, or more
+/// than one, matches, naming them. This process never matches.
+pub fn find_pid(name: &str) -> Result<u32, String> {
+  let own = std::process::id();
+  let dir = std::fs::read_dir("/proc").map_err(|err| format!("/proc: {err}"))?;
+  let mut found = Vec::new();
+  for entry in dir.flatten() {
+    let Some(pid) = entry.file_name().to_str().and_then(|el| el.parse::<u32>().ok()) else {
+      continue;
+    };
+    if pid == own {
+      continue;
+    }
+    let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+    let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+    if process_matches(name, comm.trim_end(), &cmdline) {
+      found.push(pid);
+    }
+  }
+  found.sort_unstable();
+  match found.as_slice() {
+    [pid] => Ok(*pid),
+    [] => Err(format!("no process named `{name}`")),
+    many => Err(format!("{} processes named `{name}` ({many:?}): pass --pid", many.len())),
+  }
+}
+
+/// Whether a process with command name `comm` and command line `cmdline` (NUL-separated) is named
+/// `name`: `comm` is `name` cut to 15 bytes, or `argv[0]`'s file name is `name`.
+pub fn process_matches(name: &str, comm: &str, cmdline: &[u8]) -> bool {
+  let short = name.get(..name.len().min(15)).unwrap_or(name);
+  let argv0 = cmdline.split(|el| *el == 0).next().unwrap_or_default();
+  let file = argv0.rsplit(|el| *el == b'/').next().unwrap_or_default();
+  !name.is_empty() && (comm == short || file == name.as_bytes())
+}
+
 #[derive(Debug)]
 pub enum MonitorError {
   /// The process is gone, or another one has its pid.
@@ -145,8 +182,9 @@ pub struct Budgets {
   /// Connections holding a message of up to `max_payload` on the server.
   pub large_inflight: u32,
   pub max_payload: u64,
-  /// Memory a connection may cost the server, in KiB: 256 for the WebSocket server; the HTTP/2
-  /// server streaming a large response holds more: its send buffers plus the largest write.
+  /// Memory a connection may cost the server, in KiB (0 is 256): by default 256 for WebSocket and
+  /// 768 for HTTP/2, whose server streaming a large response holds its send buffers plus the
+  /// largest write.
   pub per_slot_kib: u64,
 }
 
