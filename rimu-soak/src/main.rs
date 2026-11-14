@@ -285,6 +285,10 @@ struct H3Args {
   /// Streams per steady connection.
   #[arg(long, default_value_t = 64)]
   streams: u32,
+  /// Ends the run once the scenarios are done, instead of running the steady client on to the end
+  /// of `--duration`.
+  #[arg(long)]
+  no_hold: bool,
   /// The main server's worker count, for the report.
   #[arg(long, default_value_t = 4)]
   workers: u32,
@@ -451,7 +455,14 @@ fn raise_nofile() {
 }
 
 fn main() -> ExitCode {
-  let cli = Cli::parse();
+  // Bad arguments exit 3, like every other bad input; 2 means harness errors.
+  let cli = match Cli::try_parse() {
+    Ok(cli) => cli,
+    Err(err) => {
+      let _ = err.print();
+      return ExitCode::from(if err.use_stderr() { 3 } else { 0 });
+    }
+  };
   raise_nofile();
   let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
   let rslt = match cli.cmd {
@@ -659,6 +670,7 @@ async fn run_h3(args: H3Args) -> Result<ExitCode, String> {
     main_workers: args.workers,
     memlock_kib: memlock_kib(),
     policy,
+    hold: !args.no_hold,
   };
   let report = rimu_soak::quic::driver::run(cfg, &mut out).await;
   out.flush().map_err(|err| format!("--out: {err}"))?;

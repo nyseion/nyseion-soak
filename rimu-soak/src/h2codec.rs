@@ -262,14 +262,23 @@ impl H2 {
     Ok(H2 { conn, buf: Vec::new() })
   }
 
-  /// The next frame, `None` at EOF. SETTINGS are acknowledged and PINGs answered on the way.
+  /// The next frame, `None` at EOF. SETTINGS are acknowledged and PINGs answered on the way. An
+  /// acknowledgement the server no longer takes (it closed, say after its GOAWAY) is not an error:
+  /// what it sent before closing is still read.
   pub async fn next(&mut self, deadline: Instant) -> Result<Option<Frame>, ConnError> {
     loop {
       if let Some(frame) = parse(&mut self.buf)? {
-        if frame.ty == SETTINGS && frame.flags & ACK == 0 {
-          self.conn.send(&frame_ack(SETTINGS, &[])).await?;
+        let ack = if frame.ty == SETTINGS && frame.flags & ACK == 0 {
+          Some(frame_ack(SETTINGS, &[]))
         } else if frame.ty == PING && frame.flags & ACK == 0 {
-          self.conn.send(&frame_ack(PING, &frame.payload)).await?;
+          Some(frame_ack(PING, &frame.payload))
+        } else {
+          None
+        };
+        if let Some(ack) = ack
+          && let Err(err @ ConnError::Harness(_)) = self.conn.send(&ack).await
+        {
+          return Err(err);
         }
         return Ok(Some(frame));
       }

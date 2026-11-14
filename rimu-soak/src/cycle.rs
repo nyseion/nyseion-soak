@@ -245,7 +245,7 @@ impl State<'_> {
     if self.gone {
       return None;
     }
-    let mut monitor = self.monitor.take()?;
+    let Some(mut monitor) = self.monitor.take() else { return Some(None) };
     let (monitor, rslt) = match tokio::task::spawn_blocking(move || {
       let rslt = monitor.sample();
       (monitor, rslt)

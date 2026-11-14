@@ -101,6 +101,9 @@ pub struct H3Config {
   pub main_workers: u32,
   pub memlock_kib: Option<u64>,
   pub policy: H3Policy,
+  /// Whether the main steady client runs on to the end of `duration` after the abusers are done
+  /// (a soak), or the run ends with them (a quick conformance check).
+  pub hold: bool,
 }
 
 /// One JSONL line.
@@ -412,7 +415,7 @@ pub async fn run(cfg: H3Config, out: &mut dyn std::io::Write) -> H3Report {
 
   // Keep the main steady client running until the full duration elapses.
   let remaining = deadline.saturating_duration_since(Instant::now());
-  if remaining > Duration::ZERO {
+  if cfg.hold && remaining > Duration::ZERO {
     tokio::time::sleep(remaining).await;
   }
 

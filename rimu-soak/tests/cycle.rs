@@ -195,3 +195,13 @@ fn failures_in_saturated_seconds_are_marked() {
   let calm = Record { client_saturated: false, ..record };
   assert!(!fail_line(&calm).contains("saturated"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unmonitored_run_still_runs_its_load() {
+  let addr = spawn_fake(Faults::default()).await;
+  let mut cfg = cfg(addr, 0);
+  cfg.pid = None;
+  let summary = run(cfg, &mut Vec::new()).await;
+  assert!(summary.records > 0, "{summary:?}");
+  assert_eq!((summary.fails, summary.violations.len()), (0, 0), "{summary:?}");
+}

@@ -64,3 +64,18 @@ async fn huge_len_passes_and_fails_by_code() {
     assert!(matches!(outcome, Outcome::Fail { .. }), "seed {seed}: {outcome:?}");
   }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_too_big_code_is_configurable() {
+  // A server that refuses an oversized message with 1008 (policy violation) instead of 1009.
+  let mut ctx = ctx(spawn_fake(Faults { huge_len_code: 1008, ..Faults::default() }).await);
+  let outcome = run_case(InvalidCase::Oversized, &ctx, &mut rng(1)).await;
+  assert!(
+    matches!(&outcome, Outcome::Fail { reason, .. } if reason.contains("1008")),
+    "{outcome:?}"
+  );
+  ctx.expect.too_big = vec![1008];
+  assert_eq!(run_case(InvalidCase::Oversized, &ctx, &mut rng(1)).await, Outcome::Pass);
+  assert_eq!(run(Scenario::HugeLen, &ctx, &mut rng(1)).await, Outcome::Pass);
+  assert_eq!(run(Scenario::FragDrip, &ctx, &mut rng(3)).await, Outcome::Pass);
+}

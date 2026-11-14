@@ -765,7 +765,9 @@ async fn never_read(p: &H3Policy, target: SocketAddr) -> ScenarioResult {
         Err(_) => break,
       }
     }
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // Held for 6 s, or half the server's idle timeout if that is shorter: a connection that goes
+    // quiet for the idle timeout may rightly be closed.
+    tokio::time::sleep((p.idle_timeout / 2).min(Duration::from_secs(6))).await;
     let n = held.len();
     drive.abort();
     Ok::<usize, String>(n)

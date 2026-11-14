@@ -109,6 +109,32 @@ pub mod frames {
     out
   }
 
+  /// An ACK frame for exactly the packet numbers in `received` (RFC 9000 section 19.3), or `None`
+  /// if it is empty.
+  pub fn ack_set(received: &std::collections::BTreeSet<u64>) -> Option<Vec<u8>> {
+    // Contiguous runs, highest first, as (high, low).
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &pn in received.iter().rev() {
+      match runs.last_mut() {
+        Some(run) if run.1 == pn + 1 => run.1 = pn,
+        _ => runs.push((pn, pn)),
+      }
+    }
+    let (&(largest, low), rest) = runs.split_first()?;
+    let mut out = vec![0x02];
+    put_varint(&mut out, largest);
+    put_varint(&mut out, 0); // ack delay
+    put_varint(&mut out, rest.len() as u64);
+    put_varint(&mut out, largest - low);
+    let mut prev_low = low;
+    for &(high, low) in rest {
+      put_varint(&mut out, prev_low - high - 2); // gap
+      put_varint(&mut out, high - low); // range length
+      prev_low = low;
+    }
+    Some(out)
+  }
+
   /// A PATH_CHALLENGE frame with eight bytes of data (RFC 9000 section 19.17).
   pub fn path_challenge(data: [u8; 8]) -> Vec<u8> {
     let mut out = vec![0x1a];
@@ -358,6 +384,21 @@ pub struct RawFlap {
   pub closed: Close,
 }
 
+/// A handshake timeout, with what had arrived by then.
+fn timed_out(
+  datagrams: &[Vec<u8>],
+  received: &[std::collections::BTreeSet<u64>; 3],
+  crypto: &[u64; 3],
+  levels: &[Option<Level>; 3],
+) -> String {
+  let keys: Vec<bool> = levels.iter().map(Option::is_some).collect();
+  let pns: Vec<usize> = received.iter().map(std::collections::BTreeSet::len).collect();
+  format!(
+    "handshake timed out ({} datagrams; packets per space {pns:?}; CRYPTO offsets {crypto:?}; keys {keys:?})",
+    datagrams.len()
+  )
+}
+
 impl OneRttClient {
   /// Binds a socket (on loopback for a loopback target), runs the QUIC/TLS handshake against
   /// `target` with `server_name` for SNI, and returns once the 1-RTT keys are in hand (or an error
@@ -367,7 +408,17 @@ impl OneRttClient {
     let sock = UdpSocket::bind(bind).await.map_err(|err| format!("bind: {err}"))?;
     sock.connect(target).await.map_err(|err| format!("connect: {err}"))?;
 
-    let mut rng = crate::quic::scenario::tiny_rng(0x0ca7_b3ef ^ (target.port() as u64));
+    // Connection IDs unique to this connection: a server routes by them, and one that reused
+    // another's would reach that connection while it drains.
+    static CONNECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map_or(0, |el| el.as_nanos() as u64);
+    let local_port = u64::from(sock.local_addr().map_or(0, |el| el.port()));
+    let mut rng = crate::quic::scenario::tiny_rng(
+      0x0ca7_b3ef ^ (target.port() as u64) ^ nanos ^ count.rotate_left(32) ^ local_port << 16,
+    );
     let dcid: Vec<u8> = (0..8).map(|_| rng() as u8).collect();
     let scid: Vec<u8> = (0..8).map(|_| rng() as u8).collect();
 
@@ -403,6 +454,10 @@ impl OneRttClient {
     // in-order).
     let mut datagrams: Vec<Vec<u8>> = Vec::new();
     let mut recv_crypto = [0u64; 3];
+    // The packet numbers received in each space, which the ACKs carry, and how many of them the
+    // last ACK of each space covered.
+    let mut received: [std::collections::BTreeSet<u64>; 3] = Default::default();
+    let mut acked = [0usize; 3];
 
     loop {
       // Drain the TLS layer into per-space CRYPTO and install any new keys, re-feeding buffered
@@ -423,6 +478,7 @@ impl OneRttClient {
               Some(prev) => prev.max(pn),
               None => pn,
             });
+            let _ = received[space].insert(pn);
             if let Some((app, code)) = scan_close(&frames) {
               return Err(format!("server closed during handshake: app={app} code=0x{code:x}"));
             }
@@ -445,16 +501,21 @@ impl OneRttClient {
         }
       }
 
-      if client.levels[ONE_RTT].is_some() {
-        // The 1-RTT keys are available: the handshake produced everything we need. Send a final ACK
-        // of each long-header space so the server confirms, then return.
-        for space in [INITIAL, HANDSHAKE] {
-          if let Some(largest) = client.largest_recv[space] {
-            let ack = frames::ack_simple(largest);
+      // Acknowledge what arrived, as a client must: a server whose first flight is larger than
+      // three times what the client sent may send no more until it hears from the client (RFC
+      // 9000 section 8.1), and an Initial ACK is padded, which raises that limit.
+      let done = client.levels[ONE_RTT].is_some();
+      for space in [INITIAL, HANDSHAKE] {
+        if received[space].len() > acked[space] || done && !received[space].is_empty() {
+          acked[space] = received[space].len();
+          if let Some(ack) = frames::ack_set(&received[space]) {
             let _ = client.send_space(space, &scid, send_pn[space], &ack).await;
             send_pn[space] = send_pn[space].wrapping_add(1);
           }
         }
+      }
+      if done {
+        // The 1-RTT keys are available: the handshake produced everything needed.
         return Ok(client);
       }
 
@@ -464,13 +525,13 @@ impl OneRttClient {
         Ok(Err(err)) => return Err(format!("recv: {err}")),
         Err(_) => {
           if Instant::now() >= deadline {
-            return Err("handshake timed out".into());
+            return Err(timed_out(&datagrams, &received, &recv_crypto, &client.levels));
           }
           continue;
         }
       };
       if Instant::now() >= deadline {
-        return Err("handshake timed out".into());
+        return Err(timed_out(&datagrams, &received, &recv_crypto, &client.levels));
       }
       let datagram = buf[..len].to_vec();
       if server_scid.is_none()
@@ -870,6 +931,17 @@ mod tests {
     assert_eq!(decode_pn(Some(0xa82f_30ea), 0x9b32, 2), 0xa82f_9b32);
     assert_eq!(decode_pn(None, 0, 4), 0);
     assert_eq!(decode_pn(Some(5), 6, 1), 6);
+  }
+
+  #[test]
+  fn ack_set_encodes_ranges_highest_first() {
+    use std::collections::BTreeSet;
+    assert_eq!(frames::ack_set(&BTreeSet::new()), None);
+    let set: BTreeSet<u64> = [0, 1, 2, 5, 6].into_iter().collect();
+    // Largest 6, delay 0, 1 extra range, first range 6-5 = 1, gap 5-2-2 = 1, range 2-0 = 2.
+    assert_eq!(frames::ack_set(&set).unwrap(), vec![0x02, 6, 0, 1, 1, 1, 2]);
+    let one: BTreeSet<u64> = [7].into_iter().collect();
+    assert_eq!(frames::ack_set(&one).unwrap(), frames::ack_simple(7));
   }
 
   #[test]
