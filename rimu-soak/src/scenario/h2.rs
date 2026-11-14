@@ -48,7 +48,7 @@ pub(super) async fn steady(ctx: &Ctx, rng: &mut Rng) -> Outcome {
     let mut bytes = Vec::new();
     let mut expected = Vec::new();
     for _ in 0..25 {
-      if rng.random_bool(0.5) {
+      if rng.random_bool(0.5) || r.echo_path.is_empty() {
         bytes.extend(request(&ctx.host, id, "GET", &r.ok_path, &[], true));
         expected.push((id, r.ok_body.clone().into_bytes()));
       } else {
@@ -122,7 +122,7 @@ pub(super) async fn rapid_reset(ctx: &Ctx, _: &mut Rng) -> Outcome {
   for idx in 0..1000u32 {
     let id = 2 * idx + 1;
     // A request with a body to come keeps the stream open until the reset.
-    bytes.extend(request(&ctx.host, id, "POST", &r.echo_path, &[], false));
+    bytes.extend(request(&ctx.host, id, "POST", r.post_path(), &[], false));
     bytes.extend(frame(RST_STREAM, 0, id, &8u32.to_be_bytes()));
   }
   flood(ctx, &bytes, &ctx.expect.h2_calm, "rapid reset").await
@@ -342,7 +342,7 @@ pub(super) async fn oversized_body(ctx: &Ctx, _: &mut Rng) -> Outcome {
     Err(outcome) => return outcome,
   };
   let length = [("content-length", "100000000")];
-  let mut bytes = request(&ctx.host, 1, "POST", &ctx.routes.echo_path, &length, false);
+  let mut bytes = request(&ctx.host, 1, "POST", ctx.routes.post_path(), &length, false);
   bytes.extend(frame(DATA, 0, 1, &[b'x'; 16_384]));
   if let Err(err @ ConnError::Harness(_)) = h2.conn.send(&bytes).await {
     return from_err(err, Some(&h2.conn));

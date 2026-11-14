@@ -124,12 +124,15 @@ pub struct Monitor {
   pid: u32,
   port: u16,
   start_time: u64,
+  /// Set once `/proc/PID/fd` turned out unreadable (another user's process): descriptors then
+  /// count as 0, which turns their checks off, and the rest is still sampled.
+  fds_hidden: bool,
 }
 
 impl Monitor {
   pub fn new(pid: u32, port: u16) -> Result<Monitor, MonitorError> {
     let start_time = stat_fields(pid)?.1.get(22 - 4).copied().unwrap_or(0);
-    Ok(Monitor { pid, port, start_time })
+    Ok(Monitor { pid, port, start_time, fds_hidden: false })
   }
 
   pub fn pid(&self) -> u32 {
@@ -147,12 +150,22 @@ impl Monitor {
     let cpu_ticks = field(14) + field(15);
     let (rss_kib, hwm_kib) =
       parse_status(&read(&format!("/proc/{}/status", self.pid))?).unwrap_or((0, 0));
-    let fds = std::fs::read_dir(format!("/proc/{}/fd", self.pid))
-      .map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => MonitorError::PidGone,
-        _ => MonitorError::Io(err),
-      })?
-      .count() as u32;
+    let fds = match std::fs::read_dir(format!("/proc/{}/fd", self.pid)) {
+      Ok(dir) => dir.count() as u32,
+      Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(MonitorError::PidGone),
+      Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+        if !self.fds_hidden {
+          self.fds_hidden = true;
+          eprintln!(
+            "warning: monitor: /proc/{}/fd is not readable (run as the server's user or root): \
+             descriptors are not checked",
+            self.pid
+          );
+        }
+        0
+      }
+      Err(err) => return Err(MonitorError::Io(err)),
+    };
     let mut tcp = TcpStates::default();
     for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
       if let Ok(text) = std::fs::read_to_string(table) {

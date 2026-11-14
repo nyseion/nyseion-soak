@@ -229,13 +229,22 @@ pub struct Routes {
   /// `GET` answers 200 with `ok_body`.
   pub ok_path: String,
   pub ok_body: String,
-  /// `POST` answers 200 with the request body.
+  /// `POST` answers 200 with the request body. Empty when the server has no such route: round
+  /// trips (probes, recovery, `h2_steady`) then `GET` the ok route, and the scenarios that only
+  /// need a request with a body to come post to the ok route.
   pub echo_path: String,
   /// `GET` answers 200 with a large body (`big_len` bytes), for the slow and absent readers.
   pub big_path: String,
   pub big_len: usize,
   /// Whether byte `i` of the large body is `i % 251`, which `h2_slow_reader` then checks.
   pub big_pattern: bool,
+}
+
+impl Routes {
+  /// Where requests with a body go: the echo route, or the ok route without one.
+  pub fn post_path(&self) -> &str {
+    if self.echo_path.is_empty() { &self.ok_path } else { &self.echo_path }
+  }
 }
 
 impl Default for Routes {
@@ -314,7 +323,7 @@ impl Ctx {
 #[derive(Debug)]
 pub enum Ready {
   Ws(Conn),
-  H2 { h2: H2, next_id: u32, authority: String, echo_path: String },
+  H2 { h2: H2, next_id: u32, authority: String, routes: Box<Routes> },
 }
 
 impl Ready {
@@ -330,13 +339,13 @@ impl Ready {
         h2: H2::open(conn, None).await?,
         next_id: 1,
         authority: ctx.host.clone(),
-        echo_path: ctx.routes.echo_path.clone(),
+        routes: Box::new(ctx.routes.clone()),
       }),
     }
   }
 
   /// Sends `payload` and checks it comes back by `deadline`: a WebSocket text echo, or the body
-  /// of a `POST` to the echo route.
+  /// of a `POST` to the echo route (without one, a `GET` of the ok route, checked for its body).
   pub async fn round_trip(
     &mut self,
     payload: &[u8],
@@ -353,11 +362,16 @@ impl Ready {
             Ok(Next::Frame(echo)) if echo.opcode == 1 && echo.payload == payload
           )
       }
-      Ready::H2 { h2, next_id, authority, echo_path } => {
+      Ready::H2 { h2, next_id, authority, routes } => {
         let id = *next_id;
         *next_id += 2;
-        let mut bytes = request(authority, id, "POST", echo_path, &[], false);
-        bytes.extend(frame(DATA, END_STREAM, id, payload));
+        let (bytes, payload) = if routes.echo_path.is_empty() {
+          (request(authority, id, "GET", &routes.ok_path, &[], true), routes.ok_body.as_bytes())
+        } else {
+          let mut bytes = request(authority, id, "POST", &routes.echo_path, &[], false);
+          bytes.extend(frame(DATA, END_STREAM, id, payload));
+          (bytes, payload)
+        };
         if h2.conn.send(&bytes).await.is_err() {
           return false;
         }

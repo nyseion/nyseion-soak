@@ -99,7 +99,8 @@ struct RouteArgs {
   ok_path: String,
   #[arg(long, default_value = "ok")]
   ok_body: String,
-  /// A route whose `POST` answers 200 with the request body (HTTP/2 only).
+  /// A route whose `POST` answers 200 with the request body (HTTP/2 only); `''` if there is none,
+  /// and round trips `GET` the ok route instead.
   #[arg(long, default_value = "/echo")]
   echo_path: String,
   /// A route whose `GET` answers 200 with a large body, for the slow and absent readers.
