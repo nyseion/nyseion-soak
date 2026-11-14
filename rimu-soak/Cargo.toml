@@ -1,0 +1,54 @@
+[package]
+name = "rimu-soak"
+description = "Soak and abuse harness for WebSocket, HTTP/2 and HTTP/3 (QUIC) servers: thousands of checked clients mixed with hostile ones, and a monitor that fails the run when the server answers wrongly or stops being bounded."
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+keywords = ["websocket", "http2", "http3", "quic", "soak-testing"]
+categories = ["development-tools::testing", "network-programming"]
+readme = "../README.md"
+
+[lints]
+workspace = true
+
+[lib]
+name = "rimu_soak"
+
+[[bin]]
+name = "rimu-soak"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = { version = "7", default-features = false }
+libc = "0.2"
+rand = "0.9"
+rand_chacha = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1_smol = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+
+# The QUIC/HTTP/3 scenarios. `quinn`/`h3`/`h3-quinn` drive the library abusers; the RustCrypto
+# crates below build the raw Initial packets of `quic::raw`, so the harness speaks QUIC through
+# codecs of its own and shares no bug with the server under test.
+quinn = "0.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+bytes = "1"
+http = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+aes = "0.8"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+
+[dev-dependencies]
+# The test-only reference servers: HTTP/2 over `h2`, HTTP/3 over `quinn` + `h3` with a self-signed
+# certificate from `rcgen`.
+h2 = "0.4"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }

@@ -1,0 +1,14 @@
+[package]
+name = "udp-impair"
+description = "A seeded UDP proxy that drops, reorders, duplicates, delays and rebinds datagrams, for testing QUIC servers under impairment."
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+keywords = ["udp", "quic", "network-emulation", "testing"]
+categories = ["development-tools::testing", "network-programming"]
+readme = "../README.md"
+
+[lints]
+workspace = true
