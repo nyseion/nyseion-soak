@@ -10,7 +10,7 @@
 mod h3server;
 
 use h3server::{BIG_LEN, H3Opts, spawn_h3};
-use rimu_soak::{
+use nyseion_soak::{
   quic::{
     driver::{H3Config, H3Policy, H3Report, run},
     onertt::OneRttClient,
@@ -47,7 +47,7 @@ fn config(main_addr: SocketAddr, policy: H3Policy) -> H3Config {
   }
 }
 
-fn line<'r>(report: &'r H3Report, name: &str) -> &'r rimu_soak::quic::driver::Line {
+fn line<'r>(report: &'r H3Report, name: &str) -> &'r nyseion_soak::quic::driver::Line {
   report.results.iter().find(|el| el.name == name).unwrap_or_else(|| panic!("no {name}"))
 }
 

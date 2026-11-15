@@ -3,7 +3,7 @@
 
 #![allow(dead_code, reason = "each test binary uses part of it")]
 
-use rimu_soak::codec::{FrameSpec, LenForm, accept_key, encode};
+use nyseion_soak::codec::{FrameSpec, LenForm, accept_key, encode};
 use std::{
   net::SocketAddr,
   sync::{Arc, Mutex},

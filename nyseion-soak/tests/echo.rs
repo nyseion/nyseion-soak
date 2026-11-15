@@ -1,6 +1,6 @@
 mod support;
 
-use rimu_soak::{
+use nyseion_soak::{
   conn::ConnOpts,
   rng::{rng, seed_for},
   runner::{Record, RunConfig, replay, replay_id, run_slots},

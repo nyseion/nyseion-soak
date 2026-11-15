@@ -1,16 +1,16 @@
-# rimu-soak
+# nyseion-soak
 
 A soak and abuse harness for WebSocket, HTTP/2 and HTTP/3 (QUIC) servers. Thousands of simulated
 clients mix traffic that is checked byte for byte with hostile behaviour, while a monitor watches
 the server from outside and fails the run if the server answers wrongly or stops being bounded.
 Point it at any server; every assumption about the server is a flag whose default is what
-rimu-ws serves.
+nyseion-ws serves.
 
 The workspace also has `udp-impair`, a seeded UDP proxy that drops, reorders, duplicates, delays
 and rebinds datagrams, for running QUIC clients and servers under impairment.
 
-Part of the rimu family of performance crates, alongside [rimu-ws](https://github.com/vincentmele/rimu-ws).
-Not affiliated with the Rimu template language (`rimu` on crates.io).
+Part of the nyseion family of performance crates, alongside [nyseion-ws](https://github.com/vincentmele/nyseion-ws).
+
 
 The harness speaks raw bytes through codecs of its own: a WebSocket frame codec, an HTTP/2 frame
 codec with a literal-only HPACK encoder, and raw QUIC Initial and 1-RTT packets built with the
@@ -21,7 +21,7 @@ it shares no bug with the server under test. The well-behaved HTTP/3 clients use
 
 ```sh
 cargo build --release
-B=target/release/rimu-soak
+B=target/release/nyseion-soak
 
 # WebSocket: 200 clients for 60 s, the server's memory, descriptors and sockets watched.
 $B run --url ws://127.0.0.1:8080/ws --process-name my-server --slots 200 --duration 60s
@@ -70,7 +70,7 @@ scenario, unresolvable URL, no process of that name).
 | `--big-path`, `--big-len`, `--big-pattern` | `/static/big.bin`, 10 MiB, `true` | A large file for the slow and absent readers; with `--big-pattern true`, byte `i` must be `i % 251`. |
 | `--per-conn-kib` | 256 (ws), 768 (h2) | Memory one connection may cost the server, in the RSS limit. |
 
-The HTTP/3 limits are `h3` flags, with rimu-ws's values as defaults:
+The HTTP/3 limits are `h3` flags, with nyseion-ws's values as defaults:
 
 | Flag | Default | Used by |
 |---|---|---|
@@ -271,7 +271,7 @@ Both directions are impaired, each with its own sequence of decisions:
 ## Tests
 
 `cargo test` is self-contained. It runs the oracles against reference servers that live in
-`rimu-soak/tests/support`: an in-process WebSocket echo server with fault knobs (each oracle is
+`nyseion-soak/tests/support`: an in-process WebSocket echo server with fault knobs (each oracle is
 shown to pass a correct server and fail a broken one), an HTTP/2 server on the `h2` crate, a raw
 HTTP/2 stub that enforces control-frame budgets, and an HTTP/3 server on `quinn` and `h3` with a
 self-signed certificate. The HTTP/3 scenarios that test a policy quinn doesn't have are shown to

@@ -174,7 +174,7 @@ fn raw_socket(target: SocketAddr, last_octet: u8) -> std::io::Result<UdpSocket> 
 
 /// **Initial flood**: many distinct first Initials, each a one-byte (partial)
 /// ClientHello so the handshake stays pending and holds a half-open slot, from several source
-/// addresses (127.0.0.2..5, or ::1). Past its half-open limit (rimu-ws: `retry_above_half_open`, 64) the server answers with a
+/// addresses (127.0.0.2..5, or ::1). Past its half-open limit (nyseion-ws: `retry_above_half_open`, 64) the server answers with a
 /// Retry. A well-behaved quinn client must still connect during the flood. Pass rule: at least one
 /// Retry is seen and the quinn client connects.
 async fn initial_flood(p: &H3Policy, target: SocketAddr) -> ScenarioResult {
@@ -1089,7 +1089,7 @@ pub struct FillStats {
 }
 
 /// Opens exactly `want` idle keep-alive connections to `target` over 16 endpoints, with at most
-/// `conc` handshakes under way at once (`SOAK_FILL_CONC`, default 32: below rimu-ws's
+/// `conc` handshakes under way at once (`SOAK_FILL_CONC`, default 32: below nyseion-ws's
 /// `retry_above_half_open` 64, so the fill neither draws Retries nor reaches the
 /// `max_half_open_per_worker` drop). A failed connect is retried with a fresh one, each failure
 /// counted by its error, until `want` are held or 4 × `want` attempts are spent. Returns the held
@@ -1202,7 +1202,7 @@ async fn probe_cap(
   }
 }
 
-/// **Idle connections up to the per-worker cap** (`H3Policy::conns_per_worker`, 4,096 for rimu-ws):
+/// **Idle connections up to the per-worker cap** (`H3Policy::conns_per_worker`, 4,096 for nyseion-ws):
 /// open a one-worker server's whole allowance as idle, kept-alive connections, then one more. Pass
 /// rule: exactly the cap held, twice (a cold and a warm fill), the extra one times out (the silent
 /// drop at the cap), the server stays alive and a held connection still answers. The RSS per
@@ -1337,18 +1337,18 @@ pub async fn onertt_floods(p: &H3Policy, target: SocketAddr) -> Vec<ScenarioResu
   let excessive = Close::App(p.excessive_load);
   let mut floods: Vec<(&str, Close, Vec<Vec<u8>>)> = Vec::new();
 
-  // PING flood → excessive load (rimu-ws: `ping_budget`, 64 plus 2 per RTT, capped at 16,384 a
+  // PING flood → excessive load (nyseion-ws: `ping_budget`, 64 plus 2 per RTT, capped at 16,384 a
   // second); 40 packets of 1,200 PING frames is ~48,000 in well under a second.
   floods.push(("onertt_ping_flood", excessive, (0..40u32).map(|_| frames::pings(1200)).collect()));
 
-  // PATH_CHALLENGE flood → excessive load (rimu-ws: `path_challenge_budget` 16). 64 in one packet.
+  // PATH_CHALLENGE flood → excessive load (nyseion-ws: `path_challenge_budget` 16). 64 in one packet.
   let mut path = Vec::new();
   for i in 0..64u8 {
     path.extend_from_slice(&frames::path_challenge([i; 8]));
   }
   floods.push(("onertt_path_challenge_flood", excessive, vec![path]));
 
-  // NEW_CONNECTION_ID flood → excessive load (rimu-ws: `new_connection_id_budget` 16). 20 frames,
+  // NEW_CONNECTION_ID flood → excessive load (nyseion-ws: `new_connection_id_budget` 16). 20 frames,
   // each retiring all lower sequence numbers (retire_prior_to = seq), so the active count stays at
   // 1 — under the server's advertised active_connection_id_limit — and the per-second budget is
   // what trips, rather than CONNECTION_ID_LIMIT_ERROR. One packet.
@@ -1365,7 +1365,7 @@ pub async fn onertt_floods(p: &H3Policy, target: SocketAddr) -> Vec<ScenarioResu
   // An empty 1-RTT packet (no frames) → PROTOCOL_VIOLATION (Transport 0x0a), RFC 9000 section 12.4.
   floods.push(("onertt_empty_packet", Close::Transport(0x0a), vec![Vec::new()]));
 
-  // Out-of-order STREAM gaps past the server's range limit (rimu-ws: `max_out_of_order_ranges`
+  // Out-of-order STREAM gaps past the server's range limit (nyseion-ws: `max_out_of_order_ranges`
   // 256) → PROTOCOL_VIOLATION (Transport 0x0a). 300 one-byte frames at disjoint offsets 2,4,6,…
   // leave a gap before each, so each is a separate range. Packed ~180 per datagram.
   let mut gaps: Vec<Vec<u8>> = Vec::new();

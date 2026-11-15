@@ -1,9 +1,9 @@
-//! `rimu-soak run ...` soaks a WebSocket or HTTP/2 server; `rimu-soak h3 ...` an HTTP/3 one;
-//! `rimu-soak replay SEED:SLOT:GEN ...` reruns one scenario run alone and prints its transcript;
-//! `rimu-soak list` prints the scenarios and profiles.
+//! `nyseion-soak run ...` soaks a WebSocket or HTTP/2 server; `nyseion-soak h3 ...` an HTTP/3 one;
+//! `nyseion-soak replay SEED:SLOT:GEN ...` reruns one scenario run alone and prints its transcript;
+//! `nyseion-soak list` prints the scenarios and profiles.
 
 use clap::Parser as _;
-use rimu_soak::{
+use nyseion_soak::{
   conn::ConnOpts,
   cycle::{self, CycleConfig, Extended, RecordMode},
   monitor::find_pid,
@@ -23,7 +23,7 @@ use std::{
 // A later occurrence of an option overrides an earlier one, so a wrapper script's defaults can come
 // first.
 #[command(
-  name = "rimu-soak",
+  name = "nyseion-soak",
   version,
   about = "Soak and abuse harness for WebSocket, HTTP/2 and HTTP/3 servers",
   args_override_self = true
@@ -298,7 +298,7 @@ struct H3Args {
   server_name: String,
   #[command(flatten)]
   routes: RouteArgs,
-  /// Only these scenarios (see `rimu-soak list`), as `reset_churn,qpack_flood`.
+  /// Only these scenarios (see `nyseion-soak list`), as `reset_churn,qpack_flood`.
   #[arg(long, value_delimiter = ',', conflicts_with = "skip")]
   scenarios: Option<Vec<String>>,
   /// Every scenario but these.
@@ -498,7 +498,7 @@ fn list() {
   };
   println!("WebSocket scenarios (run --proto ws):\n  {}", names(false).join(" "));
   println!("HTTP/2 scenarios (run --proto h2):\n  {}", names(true).join(" "));
-  println!("HTTP/3 scenarios (h3):\n  {}", rimu_soak::quic::scenario::ALL.join(" "));
+  println!("HTTP/3 scenarios (h3):\n  {}", nyseion_soak::quic::scenario::ALL.join(" "));
   for (proto, label, profiles) in [
     (Proto::Ws, "WebSocket", &["baseline", "hostile", "attack", "storm", "untimed", "drip"][..]),
     (Proto::H2, "HTTP/2", &["baseline", "hostile", "attack", "storm"][..]),
@@ -636,7 +636,7 @@ async fn run_h3(args: H3Args) -> Result<ExitCode, String> {
   let main_pid = args.server.resolve()?;
   let idle_pid =
     Server { pid: args.idle_pid, process_name: args.idle_process_name.clone() }.resolve()?;
-  let all = rimu_soak::quic::scenario::ALL;
+  let all = nyseion_soak::quic::scenario::ALL;
   let scenarios = match (&args.scenarios, &args.skip) {
     (Some(only), _) => Some(only.clone()),
     (None, Some(skip)) => Some(
@@ -646,7 +646,7 @@ async fn run_h3(args: H3Args) -> Result<ExitCode, String> {
   };
   for name in scenarios.iter().flatten().chain(args.skip.iter().flatten()) {
     if !all.contains(&name.as_str()) {
-      return Err(format!("unknown h3 scenario `{name}` (see `rimu-soak list`)"));
+      return Err(format!("unknown h3 scenario `{name}` (see `nyseion-soak list`)"));
     }
   }
   let policy = H3Policy {
@@ -679,7 +679,7 @@ async fn run_h3(args: H3Args) -> Result<ExitCode, String> {
     policy,
     hold: !args.no_hold,
   };
-  let report = rimu_soak::quic::driver::run(cfg, &mut out).await;
+  let report = nyseion_soak::quic::driver::run(cfg, &mut out).await;
   out.flush().map_err(|err| format!("--out: {err}"))?;
   eprintln!("h3 soak: {} failures", report.fails);
   if args.output.json {

@@ -1,4 +1,4 @@
-use rimu_soak::monitor::{
+use nyseion_soak::monitor::{
   Baseline, Budgets, Monitor, MonitorError, Sample, TcpStates, Violation, check_drained,
   check_running, parse_status, parse_tcp_table,
 };
@@ -122,11 +122,11 @@ fn per_slot_budget_follows_the_server() {
 
 #[test]
 fn process_names_match_comm_or_argv0() {
-  use rimu_soak::monitor::process_matches;
+  use nyseion_soak::monitor::process_matches;
   assert!(process_matches("server", "server", b"/usr/bin/server\0--port\0"));
   // The kernel cuts comm to 15 bytes.
-  assert!(process_matches("httparena-rimu-ws", "httparena-rimu-", b"x\0"));
-  assert!(process_matches("httparena-rimu-ws", "other", b"./target/httparena-rimu-ws\0"));
+  assert!(process_matches("httparena-nyseion-ws", "httparena-nyseion-", b"x\0"));
+  assert!(process_matches("httparena-nyseion-ws", "other", b"./target/httparena-nyseion-ws\0"));
   assert!(!process_matches("server", "server2", b"/bin/server2\0"));
   assert!(!process_matches("", "", b""));
 }
@@ -134,23 +134,23 @@ fn process_names_match_comm_or_argv0() {
 #[test]
 fn find_pid_finds_one_process_by_name() {
   // A copy of the harness, under a name no other process has, idling in a long warmup.
-  let dir = std::env::temp_dir().join(format!("rimu-soak-find-pid-{}", std::process::id()));
+  let dir = std::env::temp_dir().join(format!("nyseion-soak-find-pid-{}", std::process::id()));
   std::fs::create_dir_all(&dir).unwrap();
   let name = format!("rsk{}", std::process::id());
   let exe = dir.join(&name);
-  std::fs::copy(env!("CARGO_BIN_EXE_rimu-soak"), &exe).unwrap();
+  std::fs::copy(env!("CARGO_BIN_EXE_nyseion-soak"), &exe).unwrap();
   let mut child = std::process::Command::new(&exe)
     .args(["run", "--url", "ws://127.0.0.1:9/", "--warmup", "30s", "--probes", "0"])
     .stderr(std::process::Stdio::null())
     .spawn()
     .unwrap();
   std::thread::sleep(std::time::Duration::from_millis(200));
-  let found = rimu_soak::monitor::find_pid(&name);
+  let found = nyseion_soak::monitor::find_pid(&name);
   let alive = child.try_wait().unwrap().is_none();
   let _ = child.kill();
   let _ = child.wait();
   let _ = std::fs::remove_dir_all(&dir);
   assert!(alive);
   assert_eq!(found, Ok(child.id()));
-  assert!(rimu_soak::monitor::find_pid("no-such-process-name-at-all").is_err());
+  assert!(nyseion_soak::monitor::find_pid("no-such-process-name-at-all").is_err());
 }

@@ -742,6 +742,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyseion-soak"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "base64",
+ "bytes",
+ "clap",
+ "futures-util",
+ "h2",
+ "h3",
+ "h3-quinn",
+ "hdrhistogram",
+ "hkdf",
+ "http",
+ "libc",
+ "quinn",
+ "rand 0.9.5",
+ "rand_chacha",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha1_smol",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -967,35 +996,6 @@ dependencies = [
  "rustls-pki-types",
  "time",
  "yasna",
-]
-
-[[package]]
-name = "rimu-soak"
-version = "0.1.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "base64",
- "bytes",
- "clap",
- "futures-util",
- "h2",
- "h3",
- "h3-quinn",
- "hdrhistogram",
- "hkdf",
- "http",
- "libc",
- "quinn",
- "rand 0.9.5",
- "rand_chacha",
- "rcgen",
- "rustls",
- "serde",
- "serde_json",
- "sha1_smol",
- "sha2",
- "tokio",
 ]
 
 [[package]]

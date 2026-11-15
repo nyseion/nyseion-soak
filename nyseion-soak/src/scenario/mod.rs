@@ -204,7 +204,7 @@ pub struct Limits {
   pub server_sndbuf: Option<u32>,
 }
 
-/// 2 s, 5 s, 2 s and 1 MiB: rimu-ws's soak server's defaults.
+/// 2 s, 5 s, 2 s and 1 MiB: nyseion-ws's soak server's defaults.
 impl Default for Limits {
   fn default() -> Self {
     Self {
@@ -223,7 +223,7 @@ pub fn slack(limit: Duration) -> Duration {
   limit * 5 / 4 + Duration::from_millis(250)
 }
 
-/// The HTTP/2 routes the scenarios use. The defaults are the HttpArena layout rimu-ws serves.
+/// The HTTP/2 routes the scenarios use. The defaults are the HttpArena layout nyseion-ws serves.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Routes {
   /// `GET` answers 200 with `ok_body`.

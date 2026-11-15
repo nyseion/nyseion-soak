@@ -2,7 +2,7 @@
 
 mod support;
 
-use rimu_soak::{
+use nyseion_soak::{
   conn::ConnOpts,
   rng::rng,
   scenario::{

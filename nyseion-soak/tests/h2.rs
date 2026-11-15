@@ -7,7 +7,7 @@
 mod h2server;
 
 use h2server::{BIG_LEN, H2Opts, spawn_h2};
-use rimu_soak::{
+use nyseion_soak::{
   rng::rng,
   scenario::{Ctx, Outcome, Proto, Routes, Scenario, run},
 };
@@ -172,7 +172,7 @@ async fn without_an_echo_route_round_trips_get_the_ok_route() {
   for scenario in [Scenario::H2Steady, Scenario::H2RapidReset, Scenario::H2OversizedBody] {
     assert_eq!(run(scenario, &ctx, &mut rng(1)).await, Outcome::Pass, "{scenario:?}");
   }
-  let mut ready = rimu_soak::scenario::Ready::open(&ctx, &mut rng(1)).await.unwrap();
+  let mut ready = nyseion_soak::scenario::Ready::open(&ctx, &mut rng(1)).await.unwrap();
   let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
   assert!(ready.round_trip(b"ignored", &mut rng(1), deadline).await);
 }

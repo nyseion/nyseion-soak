@@ -20,7 +20,7 @@ use std::{
 };
 use tokio::time::Instant;
 
-/// The server limits and routes the HTTP/3 scenarios judge the server by. The defaults are rimu-ws's
+/// The server limits and routes the HTTP/3 scenarios judge the server by. The defaults are nyseion-ws's
 /// (its HttpArena entry), so a run against another server sets what differs, and leaves out (see
 /// [`H3Policy::scenarios`]) the scenarios that test a limit the server does not have.
 #[derive(Clone, Debug)]
@@ -537,9 +537,9 @@ mod qpack_backlog_policy_tests {
   #[test]
   fn default_accepts_the_backlog_cap_and_the_encoder_stream_error() {
     let p = H3Policy::default();
-    // H3_EXCESSIVE_LOAD: a cap on the buffered backlog (rimu-ws).
+    // H3_EXCESSIVE_LOAD: a cap on the buffered backlog (nyseion-ws).
     assert!(p.accepts_qpack_backlog_close(0x0107));
-    // QPACK_ENCODER_STREAM_ERROR: the integer is rejected as malformed (rimu-qpack, RFC 9204).
+    // QPACK_ENCODER_STREAM_ERROR: the integer is rejected as malformed (nyseion-qpack, RFC 9204).
     assert!(p.accepts_qpack_backlog_close(0x0201));
     assert!(!p.accepts_qpack_backlog_close(0x0100));
   }

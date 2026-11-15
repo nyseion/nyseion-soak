@@ -1,9 +1,10 @@
 [package]
-name = "rimu-soak"
+name = "nyseion-soak"
 description = "Soak and abuse harness for WebSocket, HTTP/2 and HTTP/3 (QUIC) servers: thousands of checked clients mixed with hostile ones, and a monitor that fails the run when the server answers wrongly or stops being bounded."
 authors.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 version.workspace = true
 rust-version.workspace = true
 keywords = ["websocket", "http2", "http3", "quic", "soak-testing"]
@@ -14,10 +15,10 @@ readme = "../README.md"
 workspace = true
 
 [lib]
-name = "rimu_soak"
+name = "nyseion_soak"
 
 [[bin]]
-name = "rimu-soak"
+name = "nyseion-soak"
 path = "src/main.rs"
 
 [dependencies]
